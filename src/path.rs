@@ -1,5 +1,5 @@
+use crate::geometry::rect::Rect;
 use usvg::FillRule;
-use usvg::Rect;
 
 #[derive(Debug)]
 pub struct AbstractPath {

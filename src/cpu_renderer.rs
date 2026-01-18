@@ -4,6 +4,8 @@ use crate::path::{AbstractPath, Paint};
 use crate::quad_tree::QuadTree;
 use std::mem::swap;
 
+const DRAW_DEBUG_OVERLAY: bool = true;
+
 pub fn render_quadtree_by_node_array(
     tree: &QuadTree,
     abs_segments: &[AbstractLineSegment],
@@ -13,12 +15,10 @@ pub fn render_quadtree_by_node_array(
     img_width: u32,
     img_height: u32,
 ) {
-    println!("===== Rendering Cells =====");
     for node in &tree.nodes {
         let Some(entry_range) = node.leaf_entry_range.as_ref() else {
             continue;
         };
-        println!("{:?}", node);
 
         let left = node.bbox.left().max(0.0) as u32;
         let right = node.bbox.right().min(img_width as f32) as u32;
@@ -42,14 +42,13 @@ pub fn render_quadtree_by_node_array(
                     let is_segment = (entry.entry_type & ABSTRACT) != 0;
                     let is_winding_inc = (entry.entry_type & WINDING_INCREMENT) != 0;
                     if is_segment {
-                        assert!(entry.seg_idx.is_some());
-                        let seg = &abs_segments[entry.seg_idx.unwrap()];
-                        let sb = &seg.bounding_box;
+                        let seg = &abs_segments[entry.seg_idx as usize];
+                        let [_, top, _, bottom] = seg.bbox_ltrb;
                         let shortcut = entry.data;
 
                         if seg.is_left(x as f32, y as f32)
-                            && (y as f32) >= sb.top()
-                            && (y as f32) < sb.bottom()
+                            && (y as f32) >= top
+                            && (y as f32) < bottom
                         {
                             count += 1;
                         }
@@ -73,7 +72,7 @@ pub fn render_quadtree_by_node_array(
                         || next_entry.is_none();
                     if last_entry_in_path {
                         if count % 2 != 0 {
-                            let path = &abs_paths[entry.path_idx];
+                            let path = &abs_paths[entry.path_idx as usize];
                             if let Paint::SolidColor { rgba } = paints[path.paint_id] {
                                 out[..4].copy_from_slice(&rgba);
                             }
@@ -81,21 +80,23 @@ pub fn render_quadtree_by_node_array(
                         count = 0;
                     }
                 }
-                // TODO: only for debug
-                let debug_line_width = 6;
-                if has_shortcut && right - debug_line_width <= x && x <= right {
-                    out[..4].copy_from_slice(&[0, 255, 0, 255]);
-                };
-                let mut curr = 8;
-                for _i in 0..winc.abs() as usize {
-                    if winc != 0 && right - (curr + debug_line_width) <= x && x <= right - curr {
-                        if winc < 0 {
-                            out[..4].copy_from_slice(&[255, 0, 0, 255]);
-                        } else {
-                            out[..4].copy_from_slice(&[0, 0, 255, 255]);
+                if DRAW_DEBUG_OVERLAY {
+                    let debug_line_width = 6;
+                    if has_shortcut && right - debug_line_width <= x && x <= right {
+                        out[..4].copy_from_slice(&[0, 255, 0, 255]);
+                    };
+                    let mut curr = 8;
+                    for _i in 0..winc.abs() as usize {
+                        if winc != 0 && right - (curr + debug_line_width) <= x && x <= right - curr
+                        {
+                            if winc < 0 {
+                                out[..4].copy_from_slice(&[255, 0, 0, 255]);
+                            } else {
+                                out[..4].copy_from_slice(&[0, 0, 255, 255]);
+                            }
                         }
+                        curr += debug_line_width + 6;
                     }
-                    curr += debug_line_width + 6;
                 }
 
                 let base = ((y * img_width + x) * 4) as usize;
@@ -103,11 +104,13 @@ pub fn render_quadtree_by_node_array(
             }
         }
 
-        // QuadTree boxes
-        draw_line(left, top, right - 1, top, pixels, &line_paint);
-        draw_line(right - 1, top, right - 1, bottom - 1, pixels, &line_paint);
-        draw_line(left, bottom - 1, right - 1, bottom - 1, pixels, &line_paint);
-        draw_line(left, top, left, bottom - 1, pixels, &line_paint);
+        if DRAW_DEBUG_OVERLAY {
+            // QuadTree boxes
+            draw_line(left, top, right - 1, top, pixels, &line_paint);
+            draw_line(right - 1, top, right - 1, bottom - 1, pixels, &line_paint);
+            draw_line(left, bottom - 1, right - 1, bottom - 1, pixels, &line_paint);
+            draw_line(left, top, left, bottom - 1, pixels, &line_paint);
+        }
     }
 }
 

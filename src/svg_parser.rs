@@ -4,11 +4,12 @@ use crate::path::{AbstractPath, Paint};
 use std::fs;
 use usvg::tiny_skia_path::{PathSegment, Point};
 use usvg::{Group, Node, Path};
+use crate::geometry::rect::Rect;
 
 pub fn create_abstract_segment_array(
     abs_segments: &mut Vec<AbstractLineSegment>,
     path: &Path,
-    path_idx: usize,
+    path_idx: u32,
 ) -> usize {
     let mut start: Option<Point> = None;
     let mut curr: Option<Point> = None;
@@ -57,8 +58,7 @@ pub fn visit_group(g: &Group, paths: &mut Vec<Path>) {
     }
 }
 
-pub fn parse_svg()
--> Result<(Vec<AbstractPath>, Vec<AbstractLineSegment>, Vec<Paint>), Box<dyn std::error::Error>> {
+pub fn parse_svg() -> anyhow::Result<(Vec<AbstractPath>, Vec<AbstractLineSegment>, Vec<Paint>)> {
     let mut paths: Vec<Path> = vec![];
     let mut abs_paths: Vec<AbstractPath> = vec![];
     let mut abs_segments: Vec<AbstractLineSegment> = vec![];
@@ -77,14 +77,15 @@ pub fn parse_svg()
     // Convert paths to abstract paths, segments, paints
     let mut seg_start_idx = 0usize;
     for (i, path) in paths.iter().enumerate() {
-        let seg_count = create_abstract_segment_array(&mut abs_segments, path, i);
+        let seg_count = create_abstract_segment_array(&mut abs_segments, path, i as u32);
         let seg_end_idx = seg_start_idx + seg_count;
+        let bb = path.bounding_box();
         abs_paths.push(AbstractPath {
             seg_start_idx,
             seg_end_idx,
             fill_rule: usvg::FillRule::EvenOdd,
             paint_id: i,
-            bounding_box: path.bounding_box(),
+            bounding_box: Rect::from_ltrb(bb.left(), bb.top(), bb.right(), bb.bottom()).unwrap(),
         });
         seg_start_idx = seg_end_idx;
         // TODO: For now we have same number of paints as paths

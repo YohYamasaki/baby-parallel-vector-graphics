@@ -1,13 +1,13 @@
 use crate::abstract_segment::AbstractLineSegment;
-use crate::cell_entry::{init_root_cell_entries, subdivide_cell_entry, CellEntry, ABSTRACT};
+use crate::cell_entry::{ABSTRACT, CellEntry, init_root_cell_entries, subdivide_cell_entry};
+use crate::geometry::rect::Rect;
 use std::ops::Range;
 use usvg::tiny_skia_path::Point;
-use usvg::Rect;
 
-pub const TL_IDX: usize = 0;
-pub const TR_IDX: usize = 1;
-pub const BL_IDX: usize = 2;
-pub const BR_IDX: usize = 3;
+pub const TL_IDX: u32 = 0;
+pub const TR_IDX: u32 = 1;
+pub const BL_IDX: u32 = 2;
+pub const BR_IDX: u32 = 3;
 
 #[derive(Debug, Copy, Clone)]
 pub struct CellSegmentRef {
@@ -35,11 +35,11 @@ impl QuadTree {
         root_bbox: Rect,
         max_depth: u8,
         min_seg: usize,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let root_entries = init_root_cell_entries(&abs_segments);
         let (nodes, entries) =
-            build_quadtree(root_bbox, root_entries, max_depth, min_seg, abs_segments);
-        Self { nodes, entries }
+            build_quadtree(root_bbox, root_entries, max_depth, min_seg, abs_segments)?;
+        Ok(Self { nodes, entries })
     }
 }
 
@@ -50,7 +50,7 @@ fn build_quadtree(
     max_depth: u8,
     min_seg: usize,
     abs_segments: &[AbstractLineSegment],
-) -> (Vec<QuadCell>, Vec<CellEntry>) {
+) -> anyhow::Result<(Vec<QuadCell>, Vec<CellEntry>)> {
     // node arena; this will hold all cells' metadata
     let mut nodes: Vec<QuadCell> = Vec::new();
     let root_id: crate::cell_entry::CellId = 0;
@@ -66,7 +66,7 @@ fn build_quadtree(
     // Add cell_id to root entries
     for e in &mut root_entries {
         e.cell_id = root_id;
-        e.cell_pos = TL_IDX as u8; // Dummy
+        e.cell_pos = TL_IDX; // Dummy
     }
 
     // frontier (cells to be subdivided)
@@ -135,7 +135,7 @@ fn build_quadtree(
 
             // Subdivide parent's cell entries into child cell entries, then create contiguous entries/ranges
             let mut child_entries_flat =
-                subdivide_cell_entry(parent_entries, &parent_bbox, &mid_point, abs_segments);
+                subdivide_cell_entry(parent_entries, &parent_bbox, &mid_point, abs_segments)?;
 
             // 子ごとに仕分けして、next の contiguous な entries/ranges を作る
             // TODO: is this splitting actually required??
@@ -174,7 +174,7 @@ fn build_quadtree(
         nodes[cell_id as usize].leaf_entry_range = Some(start..leaf_entries.len());
     }
 
-    (nodes, leaf_entries)
+    Ok((nodes, leaf_entries))
 }
 
 fn get_child_bounds(parent_bbox: Rect, mid: Point) -> Option<[Rect; 4]> {

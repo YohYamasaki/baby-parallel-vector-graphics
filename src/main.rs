@@ -1,22 +1,22 @@
 mod abstract_segment;
 mod cell_entry;
 mod cpu_renderer;
+mod geometry;
+mod gpu;
 mod path;
 mod png_writer;
 mod quad_tree;
 mod svg_parser;
 
-use std::error::Error;
-use std::fmt::Debug;
-use usvg::{Path, Rect};
-
 use crate::cpu_renderer::render_quadtree_by_node_array;
+use crate::geometry::rect::Rect;
 use crate::path::Paint;
 use crate::png_writer::save_png_rgba8;
 use crate::quad_tree::QuadTree;
 use crate::svg_parser::parse_svg;
+use usvg::Path;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> anyhow::Result<()> {
     let (abs_paths, abs_segments, paints) = parse_svg()?;
 
     // Make vectors immutable
@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paints = paints;
 
     let root_bounds = Rect::from_ltrb(0.0, 0.0, 1000.0, 1000.0).unwrap();
-    let render_tree = QuadTree::new(&abs_segments, root_bounds, 4, 1);
+    let render_tree = QuadTree::new(&abs_segments, root_bounds, 4, 1)?;
 
     // Debug rendering
     let mut pixels = [0u8; 4000000];
@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         size,
         size,
     );
+
     save_png_rgba8("output/test.png", size, size, &pixels);
     Ok(())
 }

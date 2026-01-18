@@ -1,0 +1,252 @@
+const WG_SIZE: u32 = 2u;
+
+const NONE_U32: u32 = 0xFFFFFFFF;
+const TOP_LEFT: u32 = 0;
+const TOP_RIGHT: u32 = 1;
+const BOTTOM_LEFT: u32 = 2;
+const BOTTOM_RIGHT: u32 = 3;
+
+const ABSTRACT: u32 = 1 << 0;
+const WINDING_INCREMENT: u32 = 1 << 3;
+
+struct ParentCellBound {
+    bbox_ltrb: vec4<f32>,
+    mid_x: f32,
+    mid_y: f32,
+    _pad: vec2<u32>
+}
+
+struct AbstractLineSegment {
+    seg_type: u32,
+    path_idx: u32,
+    _pad0: vec2<u32>,
+    bbox_ltrb: vec4<f32>,
+    direction: u32,
+    a: f32,
+    b: f32,
+    c: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+struct CellEntry {
+    entry_type: u32,
+    data: i32,    // winding -> winding increment, segment -> shortcut
+    seg_idx: u32, // For abstract entry
+    path_idx: u32,
+    cell_pos: u32, // Use BOTTOM_LEFT ~ TOP_RIGHT
+    cell_id: u32,  // This will be provided after cell entry subdivision
+    _pad: array<u32, 2>
+}
+
+struct SplitData {
+    winding: vec4<i32>,
+    split_info: u32,
+    _pad: array<u32, 3>
+}
+
+struct SplitEntry {
+    split_data: SplitData,
+    offsets: vec4<u32>,
+    unique_id: u32,
+    seg_idx: u32, // For abstract entry
+    path_idx: u32,
+    _pad: u32
+}
+
+struct WindingBlockInfo {
+    first_path_idx: u32,
+    last_path_idx: u32,
+    all_same_path: u32,
+    _pad: u32,
+
+    tail_winding: vec4<i32>,
+}
+
+fn linearize_workgroup_id(wid: vec3<u32>, num_wg: vec3<u32>) -> u32 {
+    // linear = x + y*X + z*(X*Y)
+    return wid.x + wid.y * num_wg.x + wid.z * (num_wg.x * num_wg.y);
+}
+
+fn neutral_winc() -> WindingBlockInfo {
+    var z = WindingBlockInfo();
+    z.first_path_idx = NONE_U32;
+    z.last_path_idx = NONE_U32;
+    z.all_same_path = 0u;
+    z.tail_winding = vec4<i32>(0, 0, 0, 0);
+    return z;
+}
+
+fn merge(a: WindingBlockInfo, b: WindingBlockInfo) -> WindingBlockInfo {
+    var out = b;
+
+    let same_boundary = (a.last_path_idx == b.first_path_idx);
+    // Prefix scan updates only the winding accumulation.
+    // Keep first/last/all_same as metadata of the current entry.
+    if (same_boundary && b.all_same_path == 1u) {
+        out.tail_winding = a.tail_winding + b.tail_winding;
+    }
+    return out;
+}
+
+
+// Kernel 2 of 4.2 Parallel subdivision
+// Executes inclusive scan in this workgroup to generate the last winding per path, per cell.
+// The WindingBlockInfo array is used for both the initial winding increment data and the intermediate representation,
+// the initial WindingBlockInfo is generated in build_split_entries.wgsl.
+fn inclusive_scan_winding_inc(lid: u32) {
+    // Hillis-Steele inclusive scan
+    var offset = 1u;
+    loop {
+        if (offset >= WG_SIZE) { break; }
+        var new_winc_info = WindingBlockInfo();
+        if (lid >= offset) {
+            new_winc_info = merge(wincs[lid - offset], wincs[lid]);
+        } else {
+            new_winc_info = wincs[lid];
+        }
+        workgroupBarrier();
+
+        wincs[lid] = new_winc_info;
+        workgroupBarrier();
+
+        offset *= 2u;
+    }
+}
+
+@group(0) @binding(0) var<storage, read_write> cell_entries: array<CellEntry>;
+@group(0) @binding(1) var<storage, read_write> global_split_entries: array<SplitEntry>;
+@group(0) @binding(2) var<storage, read_write> global_cell_offsets: array<u32>;
+@group(0) @binding(3) var<storage, read_write> winding_infos_1: array<WindingBlockInfo>; // windings to consolidate
+@group(0) @binding(4) var<storage, read_write> winding_infos_2: array<WindingBlockInfo>; // sum of the winding in a block
+
+var<workgroup> wincs: array<WindingBlockInfo, 2>;
+
+@compute
+@workgroup_size(WG_SIZE)
+fn scan_winding_block(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    let wg_linear = linearize_workgroup_id(wid, num_wg);
+    let idx = wg_linear * WG_SIZE + lid.x;
+    let entries_length = arrayLength(&winding_infos_1);
+    let block_start = wg_linear * WG_SIZE;
+
+    var block_len = 0u;
+    if (block_start < entries_length) {
+        let remaining = entries_length - block_start;
+        block_len = min(WG_SIZE, remaining);
+    }
+
+    if (block_len == 0u) {
+        return;
+    }
+
+    let in_range = idx < entries_length;
+
+    if (in_range) {
+        wincs[lid.x] = winding_infos_1[idx];
+    } else {
+      wincs[lid.x] = neutral_winc(); // to avoid undefined behaviour
+  }
+    workgroupBarrier();
+
+    inclusive_scan_winding_inc(lid.x);
+    workgroupBarrier();
+
+    if (lid.x == 0u) {
+        // Build per-block summary separately from per-entry scan results.
+        let last_valid_idx = block_len - 1u;
+        var block_sum = WindingBlockInfo();
+        block_sum.first_path_idx = wincs[0].first_path_idx;
+        block_sum.last_path_idx = wincs[last_valid_idx].last_path_idx;
+        block_sum.all_same_path = select(
+            0u,
+            1u,
+            block_sum.first_path_idx == block_sum.last_path_idx
+        );
+        block_sum.tail_winding = wincs[last_valid_idx].tail_winding;
+        winding_infos_2[wg_linear] = block_sum;
+    }
+
+    if (in_range) {
+        winding_infos_1[idx] = wincs[lid.x];
+    }
+}
+
+@compute
+@workgroup_size(WG_SIZE)
+fn add_winding_carry(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    let wg_linear = linearize_workgroup_id(wid, num_wg);
+    let idx = wg_linear * WG_SIZE + lid.x;
+    let entries_length = arrayLength(&winding_infos_1);
+    let in_range = idx < entries_length;
+
+    if (!in_range || wg_linear == 0u) {
+        return;
+    }
+
+    let carry_len = arrayLength(&winding_infos_2);
+    let carry_idx = wg_linear - 1u;
+    if (carry_idx >= carry_len) {
+        return;
+    }
+
+    let carry = winding_infos_2[carry_idx];
+    var curr = winding_infos_1[idx];
+    // Carry phase should only adjust winding value.
+    // Keep first/last/all_same metadata from local scan results.
+    if (curr.all_same_path == 1u && carry.last_path_idx == curr.first_path_idx) {
+        curr.tail_winding += carry.tail_winding;
+    }
+    winding_infos_1[idx] = curr;
+}
+
+
+@compute
+@workgroup_size(WG_SIZE)
+fn mark_tail_winding(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    let wg_linear = linearize_workgroup_id(wid, num_wg);
+    let idx = wg_linear * WG_SIZE + lid.x;
+    let entries_length = arrayLength(&cell_entries);
+    let in_range = idx < entries_length;
+
+    if (!in_range) {
+        return;
+    }
+
+    var split_entry = global_split_entries[idx];
+    // Write back hierarchical winding scan result to split entries.
+    split_entry.split_data.winding = winding_infos_1[idx].tail_winding;
+
+    // insert additional offset for winding increment entry
+    var is_path_tail = idx == entries_length - 1u;
+    if (!is_path_tail) {
+        is_path_tail = cell_entries[idx + 1u].path_idx != cell_entries[idx].path_idx;
+    }
+    if (is_path_tail) {
+        for (var cell = 0u; cell < 4u; cell++) {
+            let last_winc_in_child = split_entry.split_data.winding[cell];
+            if (last_winc_in_child != 0) {
+                global_cell_offsets[cell * entries_length + idx] += 1u;
+            }
+        }
+    }
+
+    global_split_entries[idx] = split_entry;
+}

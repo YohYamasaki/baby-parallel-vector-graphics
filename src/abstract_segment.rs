@@ -1,4 +1,6 @@
-use usvg::{tiny_skia_path::Point, Rect};
+use crate::geometry::rect::Rect;
+use bytemuck::{Pod, Zeroable};
+use usvg::tiny_skia_path::Point;
 
 const EPS: f32 = 1e-6;
 
@@ -9,6 +11,30 @@ pub enum Direction {
     SW,
     SE,
     Horizontal, // TODO: split to W/E?
+}
+
+impl Direction {
+    fn from_u32(int: u32) -> Self {
+        match int {
+            0 => Direction::NW,
+            1 => Direction::NE,
+            2 => Direction::SW,
+            3 => Direction::SE,
+            4 => Direction::Horizontal,
+            _ => {
+                panic!("Invalid integer passed")
+            }
+        }
+    }
+    fn to_u32(&self) -> u32 {
+        match self {
+            Direction::NW => 0,
+            Direction::NE => 1,
+            Direction::SW => 2,
+            Direction::SE => 3,
+            Direction::Horizontal => 4,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -27,6 +53,27 @@ pub enum SegType {
     Commit,
     LastStack,
 }
+
+impl SegType {
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            SegType::Point => 0,
+            SegType::Linear => 1,
+            SegType::Quadratic => 2,
+            SegType::Cubic => 3,
+            SegType::Arc => 4,
+            SegType::Path => 5,
+            SegType::LastGeom => 6,
+            SegType::FirstStack => 7,
+            SegType::Push => 8,
+            SegType::PopFill => 9,
+            SegType::PopClip => 10,
+            SegType::Commit => 11,
+            SegType::LastStack => 12,
+        }
+    }
+}
+
 impl Direction {
     pub fn to_winding_inc(&self) -> i32 {
         match self {
@@ -37,16 +84,33 @@ impl Direction {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ImplicitLine {
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Pod, Zeroable)]
+pub struct AbstractLineSegment {
+    pub seg_type: u32,
+    pub path_idx: u32,
+    pub _pad0: [u32; 2],
+
+    pub bbox_ltrb: [f32; 4],
+
+    pub direction: u32,
     // coefficients for implicit function: ax+by+c
     a: f32,
     b: f32,
     c: f32,
+    // start point
+    pub x0: f32,
+
+    pub y0: f32,
+    // end point
+    pub x1: f32,
+    pub y1: f32,
 }
 
-impl ImplicitLine {
-    pub fn new(p0: &Point, p1: &Point) -> Self {
+impl AbstractLineSegment {
+    pub fn new(p0: Point, p1: Point, seg_type: SegType, path_id: u32) -> Self {
+        let dir = Self::direction_svg(p1.x - p0.x, p1.y - p0.y);
+        let bounding_box = Self::line_bbox(&p0, &p1);
         let mut a = p0.y - p1.y;
         let mut b = p1.x - p0.x;
         let mut c = p0.x * p1.y - p1.x * p0.y;
@@ -56,49 +120,26 @@ impl ImplicitLine {
             b = -b;
             c = -c;
         }
-        Self { a, b, c }
-    }
-
-    #[inline(always)]
-    fn eval(&self, x: f32, y: f32) -> f32 {
-        self.a * x + self.b * y + self.c
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AbstractLineSegment {
-    pub seg_type: SegType,
-    pub path_idx: usize,
-    pub bounding_box: Rect,
-    pub direction: Direction,
-    implicit_line: ImplicitLine,
-    pub p0: Point, // start point
-    pub p1: Point, // end point
-}
-
-impl AbstractLineSegment {
-    pub fn new(p0: Point, p1: Point, seg_type: SegType, path_id: usize) -> Self {
-        let direction = Self::direction_svg(p1.x - p0.x, p1.y - p0.y);
-        let bounding_box = Self::line_bbox(&p0, &p1);
-
-        let mut a = p0.y - p1.y;
-        let mut b = p1.x - p0.x;
-        let mut c = p0.x * p1.y - p1.x * p0.y;
 
         AbstractLineSegment {
-            seg_type,
-            direction,
-            bounding_box,
-            implicit_line: ImplicitLine::new(&p0, &p1),
+            seg_type: seg_type.to_u32(),
+            direction: dir.to_u32(),
+            bbox_ltrb: bounding_box.to_ltrb(),
+            a,
+            b,
+            c,
+            _pad0: [0; 2],
             path_idx: path_id,
-            p0,
-            p1,
+            x0: p0.x,
+            y0: p0.y,
+            x1: p1.x,
+            y1: p1.y,
         }
     }
 
     #[inline(always)]
-    pub(crate) fn eval(&self, x: f32, y: f32) -> f32 {
-        self.implicit_line.eval(x, y)
+    pub fn eval(&self, x: f32, y: f32) -> f32 {
+        self.a * x + self.b * y + self.c
     }
 
     #[inline(always)]
@@ -107,7 +148,8 @@ impl AbstractLineSegment {
     }
 
     pub fn going_right(&self) -> bool {
-        match self.direction {
+        let dir = Direction::from_u32(self.direction);
+        match dir {
             Direction::NW => false,
             Direction::NE => true,
             Direction::SW => false,
@@ -117,7 +159,8 @@ impl AbstractLineSegment {
     }
 
     pub fn going_up(&self) -> bool {
-        match self.direction {
+        let dir = Direction::from_u32(self.direction);
+        match dir {
             Direction::NW => true,
             Direction::NE => true,
             Direction::SW => false,
@@ -132,16 +175,16 @@ impl AbstractLineSegment {
 
     /// Returns x position of the given y.
     fn x_at_y(&self, y0: f32) -> Option<f32> {
-        let il = &self.implicit_line;
-        if il.a.abs() < EPS {
+        if self.a.abs() < EPS {
             return None; // Horizontal
         }
-        Some(-(il.b * y0 + il.c) / il.a)
+        Some(-(self.b * y0 + self.c) / self.a)
     }
 
     /// Check if the segment intersects with one of the boundaries of the given bounding box.
     pub fn intersect_with_bb(&self, bb: &Rect) -> bool {
-        if self.is_inside_bb(bb) || self.bounding_box.intersect(&bb).is_none() {
+        let bounding_box = Rect::from_ltrb_slice(&self.bbox_ltrb);
+        if self.is_inside_bb(bb) || bounding_box.unwrap().intersect(&bb).is_none() {
             return false;
         }
 
@@ -161,11 +204,10 @@ impl AbstractLineSegment {
     }
 
     pub fn is_inside_bb(&self, bb: &Rect) -> bool {
-        let seg_bb = &self.bounding_box;
-        bb.top() < seg_bb.top()
-            && bb.right() > seg_bb.right()
-            && bb.bottom() > seg_bb.bottom()
-            && bb.left() < seg_bb.left()
+        bb.left() < self.bbox_ltrb[0]
+            && bb.top() < self.bbox_ltrb[1]
+            && bb.right() > self.bbox_ltrb[2]
+            && bb.bottom() > self.bbox_ltrb[3]
     }
 
     fn direction_svg(dx: f32, dy: f32) -> Direction {
@@ -190,17 +232,13 @@ impl AbstractLineSegment {
     }
 
     pub fn hit_shortcut(&self, cell: &Rect, sample_x: f32, sample_y: f32) -> bool {
-        if self.implicit_line.b.abs() < EPS {
+        if self.b.abs() < EPS {
             // Ignore if no slope
             return false;
         }
         let x0 = cell.right();
         // Use y position of the right end of the segment
-        let y0 = if self.p0.x > self.p1.x {
-            self.p0.y
-        } else {
-            self.p1.y
-        };
+        let y0 = if self.x0 > self.x1 { self.y0 } else { self.y1 };
 
         if sample_y >= y0 {
             return false;
@@ -208,11 +246,11 @@ impl AbstractLineSegment {
         if sample_x < x0 { true } else { false }
     }
 
-    pub fn get_shortcut_base(&self) -> &Point {
-        if self.p0.x > self.p1.x {
-            &self.p0
+    pub fn get_shortcut_base(&self) -> [f32; 2] {
+        if self.x0 > self.x1 {
+            [self.x0, self.y0]
         } else {
-            &self.p1
+            [self.x1, self.y1]
         }
     }
 }
@@ -220,54 +258,57 @@ impl AbstractLineSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    static PATH_ID: usize = 0;
+    static PATH_ID: u32 = 0;
 
     #[test]
     fn direction_sw() {
         let a = Point { x: 1., y: 0. };
         let b = Point { x: 0., y: 1. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
-        assert_eq!(abs_seg.direction, Direction::SW);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
+        let dir = Direction::from_u32(abs_seg.direction);
+        assert_eq!(dir, Direction::SW);
     }
 
     #[test]
     fn direction_se() {
         let a = Point { x: 0., y: 0. };
         let b = Point { x: 1., y: 1. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
-        assert_eq!(abs_seg.direction, Direction::SE);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
+        let dir = Direction::from_u32(abs_seg.direction);
+        assert_eq!(dir, Direction::SE);
     }
 
     #[test]
     fn direction_nw() {
         let a = Point { x: 1., y: 1. };
         let b = Point { x: 0., y: 0. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
-        assert_eq!(abs_seg.direction, Direction::NW);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
+        let dir = Direction::from_u32(abs_seg.direction);
+        assert_eq!(dir, Direction::NW);
     }
 
     #[test]
     fn direction_ne() {
         let a = Point { x: 0., y: 1. };
         let b = Point { x: 1., y: 0. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
-        assert_eq!(abs_seg.direction, Direction::NE);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
+        let dir = Direction::from_u32(abs_seg.direction);
+        assert_eq!(dir, Direction::NE);
     }
 
     #[test]
     fn bounding_box() {
         let a = Point { x: 2., y: 0. };
         let b = Point { x: 0., y: 3. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
-        let expected = Rect::from_ltrb(0., 0., 2., 3.).unwrap();
-        assert_eq!(abs_seg.bounding_box, expected);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
+        assert_eq!(abs_seg.bbox_ltrb, [0., 0., 2., 3.]);
     }
 
     #[test]
     fn is_left_pt1() {
         let a = Point { x: 2., y: 0. };
         let b = Point { x: 0., y: 3. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
         println!("{:?}", &abs_seg);
         let sample = Point { x: 1., y: 1. };
         assert!(abs_seg.is_left(sample.x, sample.y));
@@ -277,7 +318,7 @@ mod tests {
     fn is_left_pt2() {
         let a = Point { x: 0., y: 3. };
         let b = Point { x: 2., y: 0. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
         println!("{:?}", &abs_seg);
         let sample = Point { x: 1., y: 1. };
         assert!(abs_seg.is_left(sample.x, sample.y));
@@ -287,7 +328,7 @@ mod tests {
     fn is_left_pt3() {
         let a = Point { x: 20., y: 80. };
         let b = Point { x: 50., y: 20. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
         println!("{:?}", abs_seg);
         let sample = Point { x: 50., y: 50. };
         assert!(!abs_seg.is_left(sample.x, sample.y));
@@ -297,7 +338,7 @@ mod tests {
     fn is_right() {
         let a = Point { x: 0., y: 0. };
         let b = Point { x: 3., y: 2. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
         let sample = Point { x: 1.51, y: 1. };
         assert!(!abs_seg.is_left(sample.x, sample.y));
     }
@@ -306,7 +347,7 @@ mod tests {
     fn is_in_bb() {
         let a = Point { x: 20., y: 20. };
         let b = Point { x: 50., y: 80. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
         let bb = Rect::from_ltrb(0.0, 0.0, 100.0, 100.0).unwrap();
         assert!(abs_seg.is_inside_bb(&bb));
     }
@@ -315,7 +356,7 @@ mod tests {
     fn intersect_with_bb() {
         let a = Point { x: 20., y: 20. };
         let b = Point { x: 40., y: 90. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
         let bb = Rect::from_ltrb(50.0, 50.0, 100.0, 100.0).unwrap();
         assert!(!abs_seg.intersect_with_bb(&bb));
     }
@@ -324,7 +365,7 @@ mod tests {
     fn not_intersect_with_bb_pt1() {
         let a = Point { x: 20., y: 20. };
         let b = Point { x: 50., y: 80. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
         let bb = Rect::from_ltrb(0.0, 0.0, 100.0, 100.0).unwrap();
         assert!(!abs_seg.intersect_with_bb(&bb));
     }
@@ -333,7 +374,7 @@ mod tests {
     fn not_intersect_with_bb_pt2() {
         let a = Point { x: 20., y: 20. };
         let b = Point { x: 30., y: 30. };
-        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear ,PATH_ID);
+        let abs_seg = AbstractLineSegment::new(a, b, SegType::Linear, PATH_ID);
         let bb = Rect::from_ltrb(50.0, 50.0, 100.0, 100.0).unwrap();
         assert!(!abs_seg.intersect_with_bb(&bb));
     }
