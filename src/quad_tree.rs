@@ -1,5 +1,7 @@
 use crate::abstract_segment::AbstractLineSegment;
-use crate::cell_entry::{ABSTRACT, CellEntry, init_root_cell_entries, subdivide_cell_entry};
+use crate::cell_entry::{
+    init_root_cell_entries, subdivide_cell_entry, CellEntry, CellId, ABSTRACT,
+};
 use crate::geometry::rect::Rect;
 use std::ops::Range;
 use usvg::tiny_skia_path::Point;
@@ -16,10 +18,10 @@ pub struct CellSegmentRef {
 }
 #[derive(Debug, Clone)]
 pub struct QuadCell {
-    pub id: crate::cell_entry::CellId,
+    pub id: CellId,
     pub depth: u8,
     pub bbox: Rect,
-    pub children: Option<[crate::cell_entry::CellId; 4]>,
+    pub children: Option<[CellId; 4]>,
     // This data will be filled once this cell is confirmed as a leaf
     pub leaf_entry_range: Option<Range<usize>>,
 }
@@ -44,17 +46,20 @@ impl QuadTree {
 }
 
 /// Build QuadTree from root CellEntry by level order.
+/// Each level processes all cells in the frontier at once, subdividing those that
+/// exceed min_seg and marking the rest as leaves.
 fn build_quadtree(
     root_bbox: Rect,
-    mut root_entries: Vec<CellEntry>,
+    root_entries: Vec<CellEntry>,
     max_depth: u8,
     min_seg: usize,
     abs_segments: &[AbstractLineSegment],
 ) -> anyhow::Result<(Vec<QuadCell>, Vec<CellEntry>)> {
-    // node arena; this will hold all cells' metadata
     let mut nodes: Vec<QuadCell> = Vec::new();
-    let root_id: crate::cell_entry::CellId = 0;
-    // add root node first
+    let mut leaf_entries: Vec<CellEntry> = Vec::new();
+
+    // Root node
+    let root_id: CellId = 0;
     nodes.push(QuadCell {
         id: root_id,
         depth: 0,
@@ -63,65 +68,40 @@ fn build_quadtree(
         leaf_entry_range: None,
     });
 
-    // Add cell_id to root entries
-    for e in &mut root_entries {
-        e.cell_id = root_id;
-        e.cell_pos = TL_IDX; // Dummy
-    }
-
-    // frontier (cells to be subdivided)
-    let mut cells_cur: Vec<crate::cell_entry::CellId> = vec![root_id];
-    let mut entries_cur: Vec<CellEntry> = root_entries;
-    let mut ranges_cur: Vec<Range<usize>> = vec![0..entries_cur.len()];
-
-    // leaf stores cells that are already done subdivision
-    let mut leaf_entries: Vec<CellEntry> = Vec::new();
+    // Frontier: list of (node_id, owned entries) pairs to process at each level.
+    // When moving to GPU, replace with a flat buffer + metadata array.
+    let mut frontier: Vec<(CellId, Vec<CellEntry>)> = vec![(root_id, root_entries)];
 
     for depth in 0..max_depth {
-        if cells_cur.is_empty() {
+        if frontier.is_empty() {
             break;
         }
 
-        let mut cells_next: Vec<crate::cell_entry::CellId> = Vec::new();
-        let mut entries_next: Vec<CellEntry> = Vec::new();
-        let mut ranges_next: Vec<Range<usize>> = Vec::new();
+        let mut next_frontier: Vec<(CellId, Vec<CellEntry>)> = Vec::new();
 
-        for (i, &parent_id) in cells_cur.iter().enumerate() {
-            let parent_range = ranges_cur[i].clone(); // for one cell
-            let parent_entries = &mut entries_cur[parent_range.clone()];
-            let parent_seg_count = parent_entries
+        for (parent_id, mut parent_entries) in frontier {
+            let abstract_count = parent_entries
                 .iter()
                 .filter(|e| (e.entry_type & ABSTRACT) != 0)
                 .count();
-            let can_split = parent_seg_count > min_seg;
             let parent_bbox = nodes[parent_id as usize].bbox;
 
-            let child_bounds = if can_split {
-                let mid = Point {
-                    x: (parent_bbox.right() + parent_bbox.left()) * 0.5,
-                    y: (parent_bbox.bottom() + parent_bbox.top()) * 0.5,
-                };
-                let Some(cb) = get_child_bounds(parent_bbox, mid) else {
-                    // bounding box is not valid, consider as a leaf
-                    let start = leaf_entries.len();
-                    leaf_entries.extend_from_slice(parent_entries);
-                    nodes[parent_id as usize].leaf_entry_range = Some(start..leaf_entries.len());
-                    continue;
-                };
-                (mid, cb)
-            } else {
-                // Cannot subdivide any more, save this cell as a leaf
-                let start = leaf_entries.len();
-                leaf_entries.extend_from_slice(parent_entries);
-                nodes[parent_id as usize].leaf_entry_range = Some(start..leaf_entries.len());
+            // Decide whether this cell needs further subdivision
+            if abstract_count <= min_seg {
+                save_as_leaf(&mut nodes, &mut leaf_entries, parent_id, parent_entries);
+                continue;
+            }
+
+            let [mid_x, mid_y] = parent_bbox.mid_point();
+            let mid = Point { x: mid_x, y: mid_y };
+            let Some(child_bounds) = get_child_bounds(parent_bbox, mid) else {
+                save_as_leaf(&mut nodes, &mut leaf_entries, parent_id, parent_entries);
                 continue;
             };
 
-            let (mid_point, child_bounds) = child_bounds;
-
-            // Create 4 child cells in arena
-            let child_ids: [crate::cell_entry::CellId; 4] = std::array::from_fn(|pos| {
-                let id = nodes.len() as crate::cell_entry::CellId;
+            // --- Create child nodes ---
+            let child_ids: [CellId; 4] = std::array::from_fn(|pos| {
+                let id = nodes.len() as CellId;
                 nodes.push(QuadCell {
                     id,
                     depth: depth + 1,
@@ -133,48 +113,67 @@ fn build_quadtree(
             });
             nodes[parent_id as usize].children = Some(child_ids);
 
-            // Subdivide parent's cell entries into child cell entries, then create contiguous entries/ranges
-            let mut child_entries_flat =
-                subdivide_cell_entry(parent_entries, &parent_bbox, &mid_point, abs_segments)?;
+            // --- Execute subdivision ---
+            let child_entries =
+                subdivide_cell_entry(&mut parent_entries, &parent_bbox, &mid, abs_segments)?;
 
-            // 子ごとに仕分けして、next の contiguous な entries/ranges を作る
-            // TODO: is this splitting actually required??
-            let mut entries_per_child: [Vec<CellEntry>; 4] = std::array::from_fn(|_| Vec::new());
-            for mut e in child_entries_flat.drain(..) {
-                // TODO: drain必要？
-                let pos = e.cell_pos as usize; // 0..3
-                e.cell_id = child_ids[pos]; // set actual child cell id
-                entries_per_child[pos].push(e);
-            }
-
-            for pos in 0..4 {
-                if entries_per_child[pos].is_empty() {
-                    continue;
+            // --- Group child entries by cell_pos and push to next frontier ---
+            // Output from subdivide is already sorted by cell_pos order (TL, TR, BL, BR)
+            for (child_id, entries) in group_by_cell_pos(child_entries, &child_ids) {
+                if !entries.is_empty() {
+                    next_frontier.push((child_id, entries));
                 }
-
-                let start = entries_next.len();
-                entries_next.extend_from_slice(&entries_per_child[pos]);
-                let end = entries_next.len();
-
-                cells_next.push(child_ids[pos]);
-                ranges_next.push(start..end);
             }
         }
 
-        cells_cur = cells_next;
-        entries_cur = entries_next;
-        ranges_cur = ranges_next;
+        frontier = next_frontier;
     }
 
-    // Add all the frontiers to the leaf vec as the maximum depth is reached
-    for (i, &cell_id) in cells_cur.iter().enumerate() {
-        let range = ranges_cur[i].clone();
-        let start = leaf_entries.len();
-        leaf_entries.extend_from_slice(&entries_cur[range]);
-        nodes[cell_id as usize].leaf_entry_range = Some(start..leaf_entries.len());
+    // Finalise remaining frontier cells as leaves (max depth reached)
+    for (cell_id, entries) in frontier {
+        save_as_leaf(&mut nodes, &mut leaf_entries, cell_id, entries);
     }
 
     Ok((nodes, leaf_entries))
+}
+
+/// Finalise a cell as a leaf and append its entries to leaf_entries.
+fn save_as_leaf(
+    nodes: &mut Vec<QuadCell>,
+    leaf_entries: &mut Vec<CellEntry>,
+    cell_id: CellId,
+    entries: Vec<CellEntry>,
+) {
+    let start = leaf_entries.len();
+    leaf_entries.extend(entries);
+    nodes[cell_id as usize].leaf_entry_range = Some(start..leaf_entries.len());
+}
+
+/// Split subdivide output into groups by cell_pos.
+/// Assumes the output is already sorted by cell_pos: 0(TL), 1(TR), 2(BL), 3(BR).
+fn group_by_cell_pos(
+    entries: Vec<CellEntry>,
+    child_ids: &[CellId; 4],
+) -> Vec<(CellId, Vec<CellEntry>)> {
+    let mut result: Vec<(CellId, Vec<CellEntry>)> = Vec::new();
+    let mut current_pos: Option<usize> = None;
+    let mut current_group: Vec<CellEntry> = Vec::new();
+
+    for mut entry in entries {
+        let pos = entry.cell_pos as usize;
+        if current_pos != Some(pos) {
+            if let Some(prev_pos) = current_pos {
+                result.push((child_ids[prev_pos], std::mem::take(&mut current_group)));
+            }
+            current_pos = Some(pos);
+        }
+        entry.cell_id = child_ids[pos]; // this overwrites the dummy id from subdivision to the actual one
+        current_group.push(entry);
+    }
+    if let Some(pos) = current_pos {
+        result.push((child_ids[pos], current_group));
+    }
+    result
 }
 
 fn get_child_bounds(parent_bbox: Rect, mid: Point) -> Option<[Rect; 4]> {
