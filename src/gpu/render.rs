@@ -1,13 +1,14 @@
 use crate::abstract_segment::AbstractLineSegment;
-use crate::cell_entry::{ABSTRACT, WINDING_INCREMENT};
+use crate::cell_entry::{CellEntry, ABSTRACT, WINDING_INCREMENT};
+use crate::gpu::quad_tree::CellMetadata;
 use crate::path::{AbstractPath, Paint};
-use crate::quad_tree::QuadTree;
 use std::mem::swap;
 
 const DRAW_DEBUG_OVERLAY: bool = true;
 
-pub fn render_quadtree_by_node_array(
-    tree: &QuadTree,
+pub fn debug_cpu_render(
+    cell_metadata: &[CellMetadata],
+    cell_entries: &[CellEntry],
     abs_segments: &[AbstractLineSegment],
     abs_paths: &[AbstractPath],
     paints: &[Paint],
@@ -15,16 +16,20 @@ pub fn render_quadtree_by_node_array(
     img_width: u32,
     img_height: u32,
 ) {
-    for node in &tree.nodes {
-        let Some(entry_range) = node.leaf_entry_range.as_ref() else {
+    for meta in cell_metadata {
+        if meta.entry_count() == 0 {
             continue;
-        };
+        }
 
-        let left = node.bbox.left().max(0.0) as u32;
-        let right = node.bbox.right().min(img_width as f32) as u32;
-        let top = node.bbox.top().max(0.0) as u32;
-        let bottom = node.bbox.bottom().min(img_height as f32) as u32;
+        let bbox = meta.bbox_rect();
+        let left = bbox.left().max(0.0) as u32;
+        let right = bbox.right().min(img_width as f32) as u32;
+        let top = bbox.top().max(0.0) as u32;
+        let bottom = bbox.bottom().min(img_height as f32) as u32;
         let line_paint = Paint::SolidColor { rgba: [255; 4] };
+
+        let entry_start = meta.entry_start() as usize;
+        let entry_end = entry_start + meta.entry_count() as usize;
 
         for y in top..bottom {
             for x in left..right {
@@ -32,12 +37,12 @@ pub fn render_quadtree_by_node_array(
                 let mut has_shortcut = false;
                 let mut winc = 0;
                 let mut count = 0;
-                for i in entry_range.start..entry_range.end {
-                    let entry = &tree.entries[i];
-                    let next_entry = if i == entry_range.end - 1 {
+                for i in entry_start..entry_end {
+                    let entry = &cell_entries[i];
+                    let next_entry = if i == entry_end - 1 {
                         None
                     } else {
-                        Some(&tree.entries[i + 1])
+                        Some(&cell_entries[i + 1])
                     };
                     let is_segment = (entry.entry_type & ABSTRACT) != 0;
                     let is_winding_inc = (entry.entry_type & WINDING_INCREMENT) != 0;
@@ -53,10 +58,9 @@ pub fn render_quadtree_by_node_array(
                             count += 1;
                         }
 
-                        if shortcut != 0 && seg.hit_shortcut(&node.bbox, x as f32, y as f32) {
+                        if shortcut != 0 && seg.hit_shortcut(&bbox, x as f32, y as f32) {
                             has_shortcut = true;
                             count += shortcut as i32;
-                            // cb_left == 625.0 && cb_right == 750.0 && cb_top == 500.0 && seg_idx == 2 && x == 630 && y == 510
                         }
                     }
 
@@ -106,15 +110,60 @@ pub fn render_quadtree_by_node_array(
 
         if DRAW_DEBUG_OVERLAY {
             // QuadTree boxes
-            draw_line(left, top, right - 1, top, pixels, &line_paint);
-            draw_line(right - 1, top, right - 1, bottom - 1, pixels, &line_paint);
-            draw_line(left, bottom - 1, right - 1, bottom - 1, pixels, &line_paint);
-            draw_line(left, top, left, bottom - 1, pixels, &line_paint);
+            draw_line(
+                left,
+                top,
+                right - 1,
+                top,
+                pixels,
+                img_width,
+                img_height,
+                &line_paint,
+            );
+            draw_line(
+                right - 1,
+                top,
+                right - 1,
+                bottom - 1,
+                pixels,
+                img_width,
+                img_height,
+                &line_paint,
+            );
+            draw_line(
+                left,
+                bottom - 1,
+                right - 1,
+                bottom - 1,
+                pixels,
+                img_width,
+                img_height,
+                &line_paint,
+            );
+            draw_line(
+                left,
+                top,
+                left,
+                bottom - 1,
+                pixels,
+                img_width,
+                img_height,
+                &line_paint,
+            );
         }
     }
 }
 
-pub fn draw_line(x1: u32, y1: u32, x2: u32, y2: u32, pixels: &mut [u8], paint: &Paint) {
+pub fn draw_line(
+    x1: u32,
+    y1: u32,
+    x2: u32,
+    y2: u32,
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    paint: &Paint,
+) {
     let w = (x1 as i32 - x2 as i32).abs();
     let h = (y1 as i32 - y2 as i32).abs();
     let is_steep = w < h;
@@ -130,15 +179,18 @@ pub fn draw_line(x1: u32, y1: u32, x2: u32, y2: u32, pixels: &mut [u8], paint: &
         swap(&mut x1, &mut x2);
         swap(&mut y1, &mut y2);
     }
+    if x1 == x2 {
+        return;
+    }
     let mut y = y1 as f32;
     let step = (y2 as i32 - y1 as i32) as f32 / (x2 as i32 - x1 as i32) as f32;
     if let Paint::SolidColor { rgba } = paint {
         for x in x1..=x2 {
             let py = y.round() as u32;
             if is_steep {
-                set_pixel(py, x, 1000, 1000, rgba, pixels);
+                set_pixel(py, x, width, height, rgba, pixels);
             } else {
-                set_pixel(x, py, 1000, 1000, rgba, pixels);
+                set_pixel(x, py, width, height, rgba, pixels);
             }
             y = y + step;
         }

@@ -28,6 +28,12 @@ fn inclusive_scan_block(lid: u32) {
 
 @group(0) @binding(0) var<storage, read_write> offsets_level_1: array<u32>;
 @group(0) @binding(1) var<storage, read_write> offsets_level_2: array<u32>;
+struct ScanParams {
+    level_len: u32,
+    carry_len: u32,
+    _pad: vec2<u32>,
+}
+@group(0) @binding(2) var<storage, read_write> scan_params: array<ScanParams>;
 
 var<workgroup> block_offsets: array<u32, WG_SIZE>;
 
@@ -40,7 +46,8 @@ fn scan_offset_block(
 ) {
     let wg_linear = linearize_workgroup_id(wid, num_wg);
     let idx = wg_linear * WG_SIZE + lid.x;
-    let level_len = arrayLength(&offsets_level_1);
+    let level_len = scan_params[0].level_len;
+    let carry_len = scan_params[0].carry_len;
     let block_start = wg_linear * WG_SIZE;
 
     var block_len = 0u;
@@ -64,7 +71,7 @@ fn scan_offset_block(
         offsets_level_1[idx] = block_offsets[lid.x];
     }
 
-    if (lid.x == 0u) {
+    if (lid.x == 0u && wg_linear < carry_len) {
         offsets_level_2[wg_linear] = block_offsets[block_len - 1u];
     }
 }
@@ -78,14 +85,14 @@ fn add_offset_carry(
 ) {
     let wg_linear = linearize_workgroup_id(wid, num_wg);
     let idx = wg_linear * WG_SIZE + lid.x;
-    let level_len = arrayLength(&offsets_level_1);
+    let level_len = scan_params[0].level_len;
 
     if (idx >= level_len || wg_linear == 0u) {
         return;
     }
 
     let carry_idx = wg_linear - 1u;
-    if (carry_idx >= arrayLength(&offsets_level_2)) {
+    if (carry_idx >= scan_params[0].carry_len) {
         return;
     }
 

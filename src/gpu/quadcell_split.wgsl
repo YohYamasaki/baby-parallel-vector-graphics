@@ -1,0 +1,72 @@
+const WG_SIZE: u32 = 1u;
+
+struct CellMetadata {
+    bbox_ltrb: vec4<f32>,
+    mid: vec2<f32>,
+    entry_start: u32,
+    entry_count: u32,
+}
+
+struct SplitResultInfo {
+    cell_entries_length: u32,
+    min_seg: u32,
+    _pad: vec2<u32>,
+}
+
+fn linearize_workgroup_id(wid: vec3<u32>, num_wg: vec3<u32>) -> u32 {
+    // linear = x + y*X + z*(X*Y)
+    return wid.x + wid.y * num_wg.x + wid.z * (num_wg.x * num_wg.y);
+}
+
+fn get_child_bounds(parent_bbox: vec4<f32>, mid_x: f32, mid_y: f32) -> array<vec4<f32>, 4> {
+    let p_left = parent_bbox[0];
+    let p_top = parent_bbox[1];
+    let p_right = parent_bbox[2];
+    let p_bottom = parent_bbox[3];
+    let tl = vec4(p_left, p_top, mid_x, mid_y);
+    let tr = vec4(mid_x, p_top, p_right, mid_y);
+    let bl = vec4(p_left, mid_y, mid_x, p_bottom);
+    let br = vec4(mid_x, mid_y, p_right, p_bottom);
+    return array(tl, tr, bl, br);
+}
+
+@group(0) @binding(0) var<storage, read> cell_metadata_in: array<CellMetadata>;
+@group(0) @binding(1) var<storage, read_write> cell_metadata_out: array<CellMetadata>;
+// result_info provides min_seg threshold for split skipping.
+@group(0) @binding(2) var<storage, read> result_info: array<SplitResultInfo>;
+
+@compute
+@workgroup_size(WG_SIZE)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    let cell_id = linearize_workgroup_id(wid, num_wg);
+    let metadata = cell_metadata_in[cell_id];
+    let entry_count = metadata.entry_count;
+    let parent_bbox = metadata.bbox_ltrb;
+    let min_seg = result_info[0].min_seg;
+
+    // Split skipping: if this cell has too few entries, treat it as a leaf.
+    // Write zero-entry child placeholders so downstream kernels have valid (empty) metadata.
+    let is_leaf = entry_count <= min_seg;
+
+    // Construct child cell metadata
+    let mid_x = (parent_bbox[2] + parent_bbox[0]) / 2;
+    let mid_y = (parent_bbox[3] + parent_bbox[1]) / 2;
+    let child_bounds = get_child_bounds(parent_bbox, mid_x, mid_y);
+    let base = cell_id * 4u;
+
+    for (var i = 0u; i < 4u; i++) {
+        var child_meta: CellMetadata;
+        child_meta.bbox_ltrb = child_bounds[i];
+        let cb = child_bounds[i];
+        child_meta.mid = vec2((cb[0] + cb[2]) * 0.5, (cb[1] + cb[3]) * 0.5);
+        // entry_start / entry_count will be filled by quadcell_update_metadata after emission.
+        // For leaf cells (split skipped), they stay 0 and no entries will be emitted.
+        child_meta.entry_start = 0u;
+        // Mark leaf children with entry_count = 0 to prevent further subdivision.
+        child_meta.entry_count = select(0u, 0u, is_leaf); // always 0; updated by update_metadata
+        cell_metadata_out[base + i] = child_meta;
+    }
+}

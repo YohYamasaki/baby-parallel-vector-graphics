@@ -6,11 +6,6 @@ use crate::geometry::rect::Rect;
 use std::ops::Range;
 use usvg::tiny_skia_path::Point;
 
-pub const TL_IDX: u32 = 0;
-pub const TR_IDX: u32 = 1;
-pub const BL_IDX: u32 = 2;
-pub const BR_IDX: u32 = 3;
-
 #[derive(Debug, Copy, Clone)]
 pub struct CellSegmentRef {
     pub seg_index: usize,
@@ -114,8 +109,12 @@ fn build_quadtree(
             nodes[parent_id as usize].children = Some(child_ids);
 
             // --- Execute subdivision ---
-            let child_entries =
-                subdivide_cell_entry(&mut parent_entries, &parent_bbox, &mid, abs_segments)?;
+            let child_entries = subdivide_cell_entry(
+                &mut parent_entries,
+                &parent_bbox,
+                &mid,
+                abs_segments,
+            )?;
 
             // --- Group child entries by cell_pos and push to next frontier ---
             // Output from subdivide is already sorted by cell_pos order (TL, TR, BL, BR)

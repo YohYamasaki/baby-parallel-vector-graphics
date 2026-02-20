@@ -2,8 +2,8 @@ use crate::abstract_segment::AbstractLineSegment;
 use crate::cell_entry::{print_split_entries, CellEntry, SplitEntry};
 use crate::geometry::rect::Rect;
 use crate::gpu::init::init_wgpu;
+use crate::gpu::quad_tree::CellMetadata;
 use bytemuck::{bytes_of, AnyBitPattern, Pod, Zeroable};
-use std::slice;
 use std::sync::mpsc::channel;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::wgt::BufferDescriptor;
@@ -29,29 +29,20 @@ fn split_dispatch_3d(workgroups_needed: u32, max_dim: u32) -> [u32; 3] {
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
-pub struct ParentCellBound {
-    bbox_ltrb: [f32; 4],
-    mid_x: f32,
-    mid_y: f32,
-    _pad: [u32; 2],
-}
-
-impl ParentCellBound {
-    pub fn new(rect: &Rect) -> Self {
-        let [mid_x, mid_y] = rect.mid_point();
-        Self {
-            bbox_ltrb: [rect.left(), rect.top(), rect.right(), rect.bottom()],
-            mid_x,
-            mid_y,
-            _pad: [0u32; 2],
-        }
-    }
+pub struct SplitResultInfo {
+    pub cell_entries_length: u32,
+    // Minimum entry count threshold for splitting a cell further.
+    // Cells with entry_count <= min_seg are treated as leaves in quadcell_split.wgsl.
+    pub min_seg: u32,
+    pub _pad: [u32; 2],
 }
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
-pub struct SplitResultInfo {
-    pub cell_entries_length: u32,
+struct ScanParams {
+    level_len: u32,
+    carry_len: u32,
+    _pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -66,60 +57,141 @@ pub struct WindingBlockInfo {
 }
 
 struct Resources {
-    // inputs
-    input_cell_entries_buffer: wgpu::Buffer,
+    // metadata (ping-pong: depth % 2 selects input/output)
+    cell_metadata_buffer_1: wgpu::Buffer,
+    cell_metadata_buffer_2: wgpu::Buffer,
+    // cell entries: single buffer, Kernel 1 reads then Kernel 5 overwrites in-place
+    cell_entries_buffer: wgpu::Buffer,
     segments_buffer: wgpu::Buffer,
-    parent_bounds_buffer: wgpu::Buffer,
     // intermediates
     split_entries_buffer: wgpu::Buffer,
     cell_offsets_buffer: wgpu::Buffer,
     winding_block_sum_buffers: Vec<Buffer>,
+    winding_scan_params_buffers: Vec<Buffer>,
     offset_block_sum_buffers: Vec<Buffer>,
-    // results
-    result_cell_entries_buffer: wgpu::Buffer,
+    offset_scan_params_buffers: Vec<Buffer>,
+    // result info
     result_info_buffer: wgpu::Buffer,
     // readbacks
     winding_block_sum_readback_buffers: Vec<Buffer>,
     split_entries_readback_buffer: wgpu::Buffer,
     cell_offsets_readback_buffer: wgpu::Buffer,
-    result_entries_readback_buffer: wgpu::Buffer,
+    cell_metadata_readback_buffer: wgpu::Buffer,
+    cell_entry_readback_buffer: wgpu::Buffer,
     result_info_readback_buffer: wgpu::Buffer,
 }
 
 impl Resources {
     fn new(
         device: &wgpu::Device,
-        parent_bound: &ParentCellBound,
         cell_entries: &[CellEntry],
         segments: &[AbstractLineSegment],
+        max_depth: u8,
     ) -> Self {
-        // inputs
-        let input_cell_entries_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("input cell entries buffer"),
-            contents: bytemuck::cast_slice(cell_entries),
+        let limits = device.limits();
+        let max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size as u64;
+        let max_buffer_size = limits.max_buffer_size;
+        let check_storage_size = |label: &str, bytes: u64| {
+            assert!(
+                bytes <= max_storage_buffer_binding_size,
+                "{label} size {bytes} exceeds max_storage_buffer_binding_size {max_storage_buffer_binding_size}"
+            );
+            assert!(
+                bytes <= max_buffer_size,
+                "{label} size {bytes} exceeds max_buffer_size {max_buffer_size}"
+            );
+            bytes
+        };
+        let checked_pow4 = |exp: u8| -> u64 {
+            let mut out = 1u64;
+            for _ in 0..exp {
+                out = out
+                    .checked_mul(4)
+                    .expect("entry capacity overflow while computing 4^max_depth");
+            }
+            out
+        };
+
+        let initial_entries = cell_entries.len().max(1) as u64;
+        let max_cell_entries = initial_entries
+            .checked_mul(checked_pow4(max_depth))
+            .expect("max_cell_entries overflow")
+            .max(1);
+        let max_split_entries = if max_depth == 0 {
+            initial_entries
+        } else {
+            initial_entries
+                .checked_mul(checked_pow4(max_depth - 1))
+                .expect("max_split_entries overflow")
+        }
+        .max(1);
+        let max_offsets = max_split_entries
+            .checked_mul(4)
+            .expect("max_offsets overflow")
+            .max(1);
+
+        // Single cell entries buffer: Kernel 1 finishes reading before Kernel 5 writes,
+        // so in-place overwrite is safe across dispatches.
+        let cell_entries_buf_size = check_storage_size(
+            "cell entries buffer",
+            max_cell_entries
+                .checked_mul(size_of::<CellEntry>() as u64)
+                .expect("cell entries buffer size overflow"),
+        );
+        let cell_entries_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("cell entries buffer"),
+            size: cell_entries_buf_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-        let parent_bounds_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("parent bound buffer"),
-            contents: bytemuck::bytes_of(parent_bound),
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_SRC,
-        });
+
+        let cell_metadata_buf_size = check_storage_size(
+            "cell metadata buffer",
+            checked_pow4(max_depth)
+                .checked_mul(size_of::<CellMetadata>() as u64)
+                .expect("cell metadata buffer size overflow")
+                .max(size_of::<CellMetadata>() as u64),
+        );
+        let create_metadata_buffer = |label: &str| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size: cell_metadata_buf_size,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let cell_metadata_buffer_1 = create_metadata_buffer("cell metadata buffer 1");
+        let cell_metadata_buffer_2 = create_metadata_buffer("cell metadata buffer 2");
         let segments_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("segments buffer"),
             contents: bytemuck::cast_slice(segments),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         });
 
-        // intermediate structures
+        // Intermediate structures are sized for the requested max_depth.
+        // max_split_entries: per-level input capacity.
+        // max_cell_entries: per-level output capacity (4x split entries).
         let split_entries_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("split entries buffer"),
-            size: (cell_entries.len() * size_of::<SplitEntry>()) as u64, // TODO: enough length?
+            size: check_storage_size(
+                "split entries buffer",
+                max_split_entries
+                    .checked_mul(size_of::<SplitEntry>() as u64)
+                    .expect("split entries buffer size overflow"),
+            ),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // cell_offsets: 4 interleaved arrays, each of length max_split_entries.
         let cell_offsets_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("parent bounds buffer"),
-            size: ((cell_entries.len() * 4 * size_of::<u32>()) as u64).max(size_of::<u32>() as u64),
+            label: Some("cell offsets buffer"),
+            size: check_storage_size(
+                "cell offsets buffer",
+                max_offsets
+                    .checked_mul(size_of::<u32>() as u64)
+                    .expect("cell offsets buffer size overflow")
+                    .max(size_of::<u32>() as u64),
+            ),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -127,17 +199,21 @@ impl Resources {
         // Create buffers for each level since the prefix sum process is done recursively the following process.
         // Scan by blocks using Hillis-Steele -> add carry from the one previous block's last element
         let create_sum_buffer = |bytes: u64| {
+            let checked = check_storage_size("winding block sum buffer", bytes.max(32));
             device.create_buffer(&BufferDescriptor {
                 label: Some("winding block sum buffer"),
-                size: bytes.max(32),
+                size: checked,
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         };
-        let cell_entries_bytes = (size_of::<WindingBlockInfo>() * cell_entries.len()) as u64;
+        // Winding block sum buffers sized for max_split_entries.
+        let cell_entries_bytes = max_split_entries
+            .checked_mul(size_of::<WindingBlockInfo>() as u64)
+            .expect("winding block sum level-0 size overflow");
         let mut winding_block_sum_buffers: Vec<Buffer> =
             vec![create_sum_buffer(cell_entries_bytes)];
-        let mut level_elms = cell_entries.len();
+        let mut level_elms = max_split_entries as usize;
         while level_elms > WG_SIZE as usize {
             let num_blocks = level_elms.div_ceil(WG_SIZE as usize).max(1);
             let bytes = (num_blocks * size_of::<WindingBlockInfo>()) as u64;
@@ -155,15 +231,17 @@ impl Resources {
         // Hierarchical scan buffers for offsets.
         // Level 0 uses `cell_offsets_buffer`; this vector keeps level>=1 and a sentinel.
         let create_offset_sum_buffer = |bytes: u64| {
+            let checked = check_storage_size("offset block sum buffer", bytes.max(size_of::<u32>() as u64));
             device.create_buffer(&BufferDescriptor {
                 label: Some("offset block sum buffer"),
-                size: bytes.max(size_of::<u32>() as u64),
+                size: checked,
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         };
+        // Offset block sum buffers: max_offsets elements.
         let mut offset_block_sum_buffers: Vec<Buffer> = vec![];
-        let mut offset_level_elms = cell_entries.len().saturating_mul(4).max(1);
+        let mut offset_level_elms = max_offsets as usize;
         while offset_level_elms > WG_SIZE as usize {
             let num_blocks = offset_level_elms.div_ceil(WG_SIZE as usize).max(1);
             let bytes = (num_blocks * size_of::<u32>()) as u64;
@@ -177,13 +255,22 @@ impl Resources {
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         }));
 
-        // results
-        let result_cell_entries_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("output cell entries buffer"),
-            size: (cell_entries.len() * 4 * size_of::<CellEntry>()) as u64, // input cell entries can be split into *4 number of child cells
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let create_scan_params_buffer = |label: &str| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size: check_storage_size("scan params buffer", size_of::<ScanParams>() as u64),
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let winding_scan_params_buffers = (0..winding_block_sum_buffers.len().saturating_sub(1))
+            .map(|_| create_scan_params_buffer("winding scan params buffer"))
+            .collect();
+        let offset_scan_params_buffers =
+            (0..(1 + offset_block_sum_buffers.len()).saturating_sub(1))
+                .map(|_| create_scan_params_buffer("offset scan params buffer"))
+                .collect();
+
         let result_info_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("result info buffer"),
             size: size_of::<SplitResultInfo>() as u64,
@@ -194,7 +281,7 @@ impl Resources {
         // readback buffers
         let result_entries_readback_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("debug out buffer"),
-            size: result_cell_entries_buffer.size(),
+            size: cell_entries_buf_size,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -204,15 +291,21 @@ impl Resources {
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let cell_offsets_readback_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("debug out buffer"),
-            size: cell_offsets_buffer.size(),
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         let result_info_readback_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("result info readback buffer"),
             size: result_info_buffer.size(),
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let cell_metadata_readback_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("cell metadata readback buffer"),
+            size: cell_metadata_buffer_1.size(),
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let cell_offsets_readback_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("cell offsets readback buffer"),
+            size: cell_offsets_buffer.size(),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -230,41 +323,51 @@ impl Resources {
             .collect();
 
         Self {
-            // inputs
-            input_cell_entries_buffer,
+            // cell metadata
+            cell_metadata_buffer_2,
+            cell_metadata_buffer_1,
+            // cell entries (single buffer, in-place overwrite)
+            cell_entries_buffer,
             segments_buffer,
-            parent_bounds_buffer,
             // intermediates
             split_entries_buffer,
             cell_offsets_buffer,
             winding_block_sum_buffers,
+            winding_scan_params_buffers,
             offset_block_sum_buffers,
-            // results
+            offset_scan_params_buffers,
+            // result info
             result_info_buffer,
-            result_cell_entries_buffer,
             // readbacks
             winding_block_sum_readback_buffers,
             cell_offsets_readback_buffer,
             split_entries_readback_buffer,
             result_info_readback_buffer,
-            result_entries_readback_buffer,
+            cell_metadata_readback_buffer,
+            cell_entry_readback_buffer: result_entries_readback_buffer,
         }
     }
 }
 
 struct Pipelines {
-    build_split: wgpu::ComputePipeline,
+    quadcell_split: wgpu::ComputePipeline,
+    build_split_entries: wgpu::ComputePipeline,
     scan_winding_block: wgpu::ComputePipeline,
     scan_offset_block: wgpu::ComputePipeline,
     add_offset_carry: wgpu::ComputePipeline,
     emit_cell_entries: wgpu::ComputePipeline,
     mark_tail_winding_offsets: wgpu::ComputePipeline,
     add_winding_carry: wgpu::ComputePipeline,
+    update_metadata: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
     fn new(device: &wgpu::Device) -> Self {
-        let split_shader = device.create_shader_module(ShaderModuleDescriptor {
+        let quadcell_split_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("quadcell split shader"),
+            source: ShaderSource::Wgsl(include_str!("quadcell_split.wgsl").into()),
+        });
+        let split_cell_entry_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("split shader"),
             source: ShaderSource::Wgsl(include_str!("build_split_entries.wgsl").into()),
         });
@@ -280,6 +383,19 @@ impl Pipelines {
             label: Some("split to cell entry shader"),
             source: ShaderSource::Wgsl(include_str!("split_to_cell_entry.wgsl").into()),
         });
+        let update_metadata_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("update metadata shader"),
+            source: ShaderSource::Wgsl(include_str!("quadcell_update_metadata.wgsl").into()),
+        });
+
+        let quadcell_split = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("quadcell split pipeline"),
+            layout: None,
+            module: &quadcell_split_shader,
+            entry_point: None,
+            compilation_options: Default::default(),
+            cache: Default::default(),
+        });
 
         let bgl_storage_entry = |binding: u32| BindGroupLayoutEntry {
             binding,
@@ -292,6 +408,9 @@ impl Pipelines {
             count: None,
         };
 
+        // winding shaders:
+        // bindings 0-4 (cell_entries, split_entries, cell_offsets, winding_1, winding_2)
+        // binding 5 (result_info), binding 6 (per-dispatch scan params)
         let winding_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("winding bind group"),
             entries: &[
@@ -300,6 +419,8 @@ impl Pipelines {
                 bgl_storage_entry(2),
                 bgl_storage_entry(3),
                 bgl_storage_entry(4),
+                bgl_storage_entry(5),
+                bgl_storage_entry(6),
             ],
         });
 
@@ -311,7 +432,11 @@ impl Pipelines {
 
         let offset_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("offset bind group"),
-            entries: &[bgl_storage_entry(0), bgl_storage_entry(1)],
+            entries: &[
+                bgl_storage_entry(0),
+                bgl_storage_entry(1),
+                bgl_storage_entry(2),
+            ],
         });
         let offset_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("offset pl"),
@@ -322,7 +447,7 @@ impl Pipelines {
         let build_split = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("split pipeline"),
             layout: None,
-            module: &split_shader,
+            module: &split_cell_entry_shader,
             entry_point: None,
             compilation_options: Default::default(),
             cache: Default::default(),
@@ -378,27 +503,24 @@ impl Pipelines {
             compilation_options: Default::default(),
             cache: Default::default(),
         });
-
+        let update_metadata = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("update metadata pipeline"),
+            layout: None,
+            module: &update_metadata_shader,
+            entry_point: None,
+            compilation_options: Default::default(),
+            cache: Default::default(),
+        });
         Self {
-            build_split,
+            quadcell_split,
+            build_split_entries: build_split,
             scan_winding_block,
             add_winding_carry,
             mark_tail_winding_offsets,
             scan_offset_block,
             add_offset_carry,
             emit_cell_entries,
-        }
-    }
-
-    fn get(&self, id: PipelineId) -> &wgpu::ComputePipeline {
-        match id {
-            PipelineId::BuildSplit => &self.build_split,
-            PipelineId::ScanWindingBlock => &self.scan_winding_block,
-            PipelineId::AddWindingCarry => &self.add_winding_carry,
-            PipelineId::MarkTailWindingOffsets => &self.mark_tail_winding_offsets,
-            PipelineId::ScanOffsetBlock => &self.scan_offset_block,
-            PipelineId::AddOffsetCarry => &self.add_offset_carry,
-            PipelineId::EmitCellEntries => &self.emit_cell_entries,
+            update_metadata,
         }
     }
 }
@@ -411,77 +533,125 @@ fn bg_entry(binding: u32, buffer: &wgpu::Buffer) -> BindGroupEntry<'_> {
 }
 
 struct BindGroups {
-    split: wgpu::BindGroup,
+    split_quadcell: [wgpu::BindGroup; 2],
+    split_cell_entry: [wgpu::BindGroup; 2],
     mark_tail: wgpu::BindGroup,
     offset_scan_bgs: Vec<wgpu::BindGroup>,
     emit_result: wgpu::BindGroup,
     winding_scan_bgs: Vec<wgpu::BindGroup>,
+    update_metadata: [wgpu::BindGroup; 2],
 }
 
 impl BindGroups {
     fn new(device: &wgpu::Device, resources: &Resources, pipelines: &Pipelines) -> Self {
         let Resources {
-            // inputs
-            input_cell_entries_buffer,
+            cell_metadata_buffer_1,
+            cell_metadata_buffer_2,
+            cell_entries_buffer,
             segments_buffer,
-            parent_bounds_buffer,
             // intermediates
             split_entries_buffer,
             cell_offsets_buffer,
             winding_block_sum_buffers,
+            winding_scan_params_buffers,
             offset_block_sum_buffers,
-            // results
-            result_cell_entries_buffer,
+            offset_scan_params_buffers,
+            // result info
             result_info_buffer,
             ..
         } = resources;
 
         let Pipelines {
-            build_split,
+            quadcell_split,
+            build_split_entries: build_split,
             scan_winding_block,
             mark_tail_winding_offsets,
             scan_offset_block,
             emit_cell_entries,
+            update_metadata,
             ..
         } = pipelines;
 
-        let split = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("split bind group"),
+        // QuadCell split: cell_metadata ping-pong (reads parent metadata, writes child metadata).
+        // binding(2) = result_info for min_seg threshold used in split skipping.
+        let split_quadcell_ping = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("split quadcell ping bind group"),
+            layout: &quadcell_split.get_bind_group_layout(0),
+            entries: &[
+                bg_entry(0, cell_metadata_buffer_1),
+                bg_entry(1, cell_metadata_buffer_2),
+                bg_entry(2, result_info_buffer),
+            ],
+        });
+        let split_quadcell_pong = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("split quadcell pong bind group"),
+            layout: &quadcell_split.get_bind_group_layout(0),
+            entries: &[
+                bg_entry(0, cell_metadata_buffer_2),
+                bg_entry(1, cell_metadata_buffer_1),
+                bg_entry(2, result_info_buffer),
+            ],
+        });
+
+        // Initial Split: build_split_entries reads cell_entries + cell_metadata (ping-pong for metadata).
+        let split_cell_entry_ping = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("split cell entry ping bind group"),
             layout: &build_split.get_bind_group_layout(0),
             entries: &[
-                bg_entry(0, input_cell_entries_buffer),
+                bg_entry(0, cell_entries_buffer),
                 bg_entry(1, segments_buffer),
-                bg_entry(2, parent_bounds_buffer),
+                bg_entry(2, cell_metadata_buffer_1),
                 bg_entry(3, split_entries_buffer),
                 bg_entry(4, cell_offsets_buffer),
                 bg_entry(5, &winding_block_sum_buffers[0]),
+                bg_entry(6, result_info_buffer),
             ],
         });
-        let mut winding_scan_bgs: Vec<BindGroup> = vec![];
+        let split_cell_entry_pong = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("split cell entry pong bind group"),
+            layout: &build_split.get_bind_group_layout(0),
+            entries: &[
+                bg_entry(0, cell_entries_buffer),
+                bg_entry(1, segments_buffer),
+                bg_entry(2, cell_metadata_buffer_2),
+                bg_entry(3, split_entries_buffer),
+                bg_entry(4, cell_offsets_buffer),
+                bg_entry(5, &winding_block_sum_buffers[0]),
+                bg_entry(6, result_info_buffer),
+            ],
+        });
+
+        let mut winding_scan_bgs = Vec::new();
         for i in 0..winding_block_sum_buffers.len() - 1 {
             winding_scan_bgs.push(device.create_bind_group(&BindGroupDescriptor {
                 label: Some("winding scan bind group"),
                 layout: &scan_winding_block.get_bind_group_layout(0),
                 entries: &[
-                    bg_entry(0, input_cell_entries_buffer),
+                    bg_entry(0, cell_entries_buffer),
                     bg_entry(1, split_entries_buffer),
                     bg_entry(2, cell_offsets_buffer),
                     bg_entry(3, &winding_block_sum_buffers[i]),
                     bg_entry(4, &winding_block_sum_buffers[i + 1]),
+                    bg_entry(5, result_info_buffer),
+                    bg_entry(6, &winding_scan_params_buffers[i]),
                 ],
             }));
         }
+
         let mark_tail = device.create_bind_group(&BindGroupDescriptor {
             label: Some("mark tail bind group"),
             layout: &mark_tail_winding_offsets.get_bind_group_layout(0),
             entries: &[
-                bg_entry(0, input_cell_entries_buffer),
+                bg_entry(0, cell_entries_buffer),
                 bg_entry(1, split_entries_buffer),
                 bg_entry(2, cell_offsets_buffer),
                 bg_entry(3, &winding_block_sum_buffers[0]),
                 bg_entry(4, &winding_block_sum_buffers[1]),
+                bg_entry(5, result_info_buffer),
+                bg_entry(6, &winding_scan_params_buffers[0]),
             ],
         });
+
         let mut offset_scan_bgs: Vec<BindGroup> = vec![];
         let mut offset_levels: Vec<&Buffer> = vec![cell_offsets_buffer];
         offset_levels.extend(offset_block_sum_buffers.iter());
@@ -489,167 +659,114 @@ impl BindGroups {
             offset_scan_bgs.push(device.create_bind_group(&BindGroupDescriptor {
                 label: Some("offsets scan bind group"),
                 layout: &scan_offset_block.get_bind_group_layout(0),
-                entries: &[bg_entry(0, offset_levels[i]), bg_entry(1, offset_levels[i + 1])],
+                entries: &[
+                    bg_entry(0, offset_levels[i]),
+                    bg_entry(1, offset_levels[i + 1]),
+                    bg_entry(2, &offset_scan_params_buffers[i]),
+                ],
             }));
         }
+
+        // Emit result: emit_cell_entries writes to cell_entries (in-place overwrite)
         let emit_result = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("split to cell bind group"),
+            label: Some("emit result bind group"),
             layout: &emit_cell_entries.get_bind_group_layout(0),
             entries: &[
-                bg_entry(0, result_cell_entries_buffer),
+                bg_entry(0, cell_entries_buffer),
                 bg_entry(1, split_entries_buffer),
                 bg_entry(2, cell_offsets_buffer),
                 bg_entry(3, result_info_buffer),
             ],
         });
 
+        // Update metadata: reads cell_entries, writes to output cell_metadata (ping-pong for metadata)
+        let update_metadata_ping = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("update metadata ping bind group"),
+            layout: &update_metadata.get_bind_group_layout(0),
+            entries: &[
+                bg_entry(0, cell_entries_buffer),
+                bg_entry(1, cell_metadata_buffer_2), // even depth: metadata output is buffer_2
+                bg_entry(2, result_info_buffer),
+            ],
+        });
+        let update_metadata_pong = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("update metadata pong bind group"),
+            layout: &update_metadata.get_bind_group_layout(0),
+            entries: &[
+                bg_entry(0, cell_entries_buffer),
+                bg_entry(1, cell_metadata_buffer_1), // odd depth: metadata output is buffer_1
+                bg_entry(2, result_info_buffer),
+            ],
+        });
+
         Self {
-            split,
+            split_quadcell: [split_quadcell_ping, split_quadcell_pong],
+            split_cell_entry: [split_cell_entry_ping, split_cell_entry_pong],
             mark_tail,
             winding_scan_bgs,
             offset_scan_bgs,
             emit_result,
-        }
-    }
-
-    fn get(&self, id: BindGroupId) -> &[wgpu::BindGroup] {
-        match id {
-            BindGroupId::Split => slice::from_ref(&self.split),
-            BindGroupId::MarkTail => slice::from_ref(&self.mark_tail),
-            BindGroupId::EmitResult => slice::from_ref(&self.emit_result),
+            update_metadata: [update_metadata_ping, update_metadata_pong],
         }
     }
 }
-
-#[derive(Debug, Copy, Clone)]
-enum PipelineId {
-    BuildSplit,
-    ScanWindingBlock,
-    ScanOffsetBlock,
-    AddOffsetCarry,
-    EmitCellEntries,
-    AddWindingCarry,
-    MarkTailWindingOffsets,
-}
-
-#[derive(Debug, Copy, Clone)]
-enum BindGroupId {
-    Split,
-    MarkTail,
-    EmitResult,
-    // BlockSums,
-}
-
-#[derive(Debug, Copy, Clone)]
-enum DispatchKind {
-    ByEntries, // num_entries
-    ByOffsets, // num_entries * 4
-}
-
-#[derive(Debug, Copy, Clone)]
-enum PassSpec {
-    Single {
-        pipeline: PipelineId,
-        bind_group: BindGroupId,
-        dispatch: DispatchKind,
-    },
-    WindingHerarchy,
-    OffsetHerarchy,
-}
-
-#[derive(Debug, Copy, Clone)]
-struct RunMeta {
-    num_entries: u32,
-    num_offsets: u32,
-}
-
-impl RunMeta {
-    fn new(num_entries: u32) -> Self {
-        let num_offsets = num_entries.saturating_mul(4);
-        Self {
-            num_entries,
-            num_offsets,
-        }
-    }
-
-    fn item_count(self, kind: DispatchKind) -> u32 {
-        match kind {
-            DispatchKind::ByEntries => self.num_entries.max(1),
-            DispatchKind::ByOffsets => self.num_offsets.max(1),
-        }
-    }
-
-    fn winding_level_entries(self, levels: usize) -> Vec<u32> {
-        let mut out = Vec::with_capacity(levels);
-        let mut n = self.num_entries.max(1);
-        for _ in 0..levels {
-            out.push(n);
-            n = n.div_ceil(WG_SIZE).max(1);
-        }
-        out
-    }
-
-    fn offset_level_entries(self, levels: usize) -> Vec<u32> {
-        let mut out = Vec::with_capacity(levels);
-        let mut n = self.num_offsets.max(1);
-        for _ in 0..levels {
-            out.push(n);
-            n = n.div_ceil(WG_SIZE).max(1);
-        }
-        out
-    }
-}
-
-const PASS_GRAPH: &[PassSpec] = &[
-    PassSpec::Single {
-        pipeline: PipelineId::BuildSplit,
-        bind_group: BindGroupId::Split,
-        dispatch: DispatchKind::ByEntries,
-    },
-    PassSpec::WindingHerarchy,
-    PassSpec::Single {
-        pipeline: PipelineId::MarkTailWindingOffsets,
-        bind_group: BindGroupId::MarkTail,
-        dispatch: DispatchKind::ByEntries,
-    },
-    PassSpec::OffsetHerarchy,
-    PassSpec::Single {
-        pipeline: PipelineId::EmitCellEntries,
-        bind_group: BindGroupId::EmitResult,
-        dispatch: DispatchKind::ByOffsets,
-    },
-];
 
 fn dispatch_for_items(items: u32, max_dim: u32) -> [u32; 3] {
     let wg = items.max(1).div_ceil(WG_SIZE);
     split_dispatch_3d(wg, max_dim)
 }
 
-fn dispatch_for(kind: DispatchKind, meta: RunMeta, max_dim: u32) -> [u32; 3] {
-    dispatch_for_items(meta.item_count(kind), max_dim)
+/// Compute the number of elements at each hierarchical scan level.
+/// Starting from `initial` elements, each level reduces by WG_SIZE.
+fn hierarchical_level_counts(initial: u32, levels: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(levels);
+    let mut n = initial;
+    for _ in 0..levels {
+        out.push(n);
+        if n <= 1 {
+            break;
+        }
+        n = n.div_ceil(WG_SIZE);
+    }
+    out
 }
 
-pub struct CellEntryGpuContext {
+pub struct QuadTreeGpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipelines: Pipelines,
     resources: Resources,
     bind_groups: BindGroups,
     num_cell_entries: u32,
+    // Minimum entry count for a cell to be split further (passed to quadcell_split.wgsl).
+    min_seg: u32,
 }
 
-impl CellEntryGpuContext {
+impl QuadTreeGpuContext {
     pub async fn new(
         cell_entries: &[CellEntry],
         segments: &[AbstractLineSegment],
-        parent_bound: &ParentCellBound,
+        parent_bound: &Rect,
+        max_depth: u8,
+        min_seg: u32,
     ) -> anyhow::Result<Self> {
         let (device, queue) = init_wgpu().await;
 
         let pipelines = Pipelines::new(&device);
-        let resources = Resources::new(&device, &parent_bound, &cell_entries, &segments);
+        let resources = Resources::new(&device, &cell_entries, &segments, max_depth);
         let bind_groups = BindGroups::new(&device, &resources, &pipelines);
-
+        // Write initial data
+        let root_meta = CellMetadata::new(parent_bound, 0, cell_entries.len() as u32);
+        queue.write_buffer(
+            &resources.cell_metadata_buffer_1,
+            0,
+            bytemuck::cast_slice(&[root_meta]),
+        );
+        queue.write_buffer(
+            &resources.cell_entries_buffer,
+            0,
+            bytemuck::cast_slice(cell_entries),
+        );
         Ok(Self {
             device,
             queue,
@@ -657,81 +774,133 @@ impl CellEntryGpuContext {
             resources,
             bind_groups,
             num_cell_entries: cell_entries.len() as u32,
+            min_seg,
         })
     }
 
-    fn run_winding_hierarchy(&self, pass: &mut wgpu::ComputePass<'_>, meta: RunMeta, max_dim: u32) {
-        let bgs = &self.bind_groups.winding_scan_bgs;
-        let level_entries = meta.winding_level_entries(bgs.len());
-
-        // forward: scan + block_sum
-        for i in 0..bgs.len() {
-            pass.set_pipeline(self.pipelines.get(PipelineId::ScanWindingBlock));
-            pass.set_bind_group(0, &bgs[i], &[]);
-            let [x, y, z] = dispatch_for_items(level_entries[i], max_dim);
-            pass.dispatch_workgroups(x, y, z);
-        }
-
-        // reverse: add carry (top level is parentなしなので除外)
-        for i in (0..bgs.len().saturating_sub(1)).rev() {
-            pass.set_pipeline(self.pipelines.get(PipelineId::AddWindingCarry));
-            pass.set_bind_group(0, &bgs[i], &[]);
-            let [x, y, z] = dispatch_for_items(level_entries[i], max_dim);
-            pass.dispatch_workgroups(x, y, z);
-        }
-    }
-
-    fn run_offset_hierarchy(&self, pass: &mut wgpu::ComputePass<'_>, meta: RunMeta, max_dim: u32) {
-        let bgs = &self.bind_groups.offset_scan_bgs;
-        let level_entries = meta.offset_level_entries(bgs.len());
-
-        // forward: scan + block_sum
-        for i in 0..bgs.len() {
-            pass.set_pipeline(self.pipelines.get(PipelineId::ScanOffsetBlock));
-            pass.set_bind_group(0, &bgs[i], &[]);
-            let [x, y, z] = dispatch_for_items(level_entries[i], max_dim);
-            pass.dispatch_workgroups(x, y, z);
-        }
-
-        // reverse: add carry (top level has no parent carry)
-        for i in (0..bgs.len().saturating_sub(1)).rev() {
-            pass.set_pipeline(self.pipelines.get(PipelineId::AddOffsetCarry));
-            pass.set_bind_group(0, &bgs[i], &[]);
-            let [x, y, z] = dispatch_for_items(level_entries[i], max_dim);
-            pass.dispatch_workgroups(x, y, z);
-        }
-    }
-
-    pub fn run_subdivision(&self) {
+    /// Process one level of quad-tree subdivision.
+    /// 1. Split quad cells (compute child bboxes and write to cell_metadata_out)
+    /// 2. Run entry subdivision kernels 1-5 (split entries among child cells)
+    ///
+    /// `num_entries` is the actual number of entries in `cell_entries_buffer` for this depth.
+    /// It is written into `result_info` before any shader runs so that shaders can read it
+    /// instead of relying on `arrayLength()`.
+    pub fn process_level(&self, depth: u8, num_cells: u32, num_entries: u32) {
         let max_dim = self.device.limits().max_compute_workgroups_per_dimension;
+        let ping = (depth % 2) as usize;
+        let num_offsets = num_entries.saturating_mul(4);
+        let max_result_entries = num_offsets; // each entry can split into at most 4 child entries
+        let winding_levels =
+            hierarchical_level_counts(num_entries, self.bind_groups.winding_scan_bgs.len());
+        let offset_levels =
+            hierarchical_level_counts(num_offsets, self.bind_groups.offset_scan_bgs.len());
+
+        // Write the actual entry count and min_seg threshold into result_info.
+        // This must happen before the compute encoder so the write is visible to all kernels.
+        self.queue.write_buffer(
+            &self.resources.result_info_buffer,
+            0,
+            bytemuck::cast_slice(&[SplitResultInfo {
+                cell_entries_length: num_entries,
+                min_seg: self.min_seg,
+                _pad: [0; 2],
+            }]),
+        );
+        for (i, &level_len) in winding_levels.iter().enumerate() {
+            self.queue.write_buffer(
+                &self.resources.winding_scan_params_buffers[i],
+                0,
+                bytes_of(&ScanParams {
+                    level_len,
+                    carry_len: level_len.div_ceil(WG_SIZE),
+                    _pad: [0; 2],
+                }),
+            );
+        }
+        for (i, &level_len) in offset_levels.iter().enumerate() {
+            self.queue.write_buffer(
+                &self.resources.offset_scan_params_buffers[i],
+                0,
+                bytes_of(&ScanParams {
+                    level_len,
+                    carry_len: level_len.div_ceil(WG_SIZE),
+                    _pad: [0; 2],
+                }),
+            );
+        }
+
         let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        // Clear intermediate buffers from the previous level to avoid stale data.
+        // cell_offsets: 4 interleaved offset arrays, all must start at 0 before scanning.
+        encoder.clear_buffer(&self.resources.cell_offsets_buffer, 0, None);
+        // winding_block_sum level-0: initial per-entry winding accumulators must start clean.
+        encoder.clear_buffer(&self.resources.winding_block_sum_buffers[0], 0, None);
+
         {
-            let meta = RunMeta::new(self.num_cell_entries);
             let mut pass = encoder.begin_compute_pass(&Default::default());
 
-            for spec in PASS_GRAPH {
-                match spec {
-                    PassSpec::Single {
-                        pipeline,
-                        bind_group,
-                        dispatch,
-                        ..
-                    } => {
-                        pass.set_pipeline(self.pipelines.get(*pipeline));
-                        self.bind_groups.get(*bind_group).iter().for_each(|bg| {
-                            pass.set_bind_group(0, bg, &[]);
-                            let [x, y, z] = dispatch_for(*dispatch, meta, max_dim);
-                            pass.dispatch_workgroups(x, y, z);
-                        });
-                    }
-                    PassSpec::WindingHerarchy => {
-                        self.run_winding_hierarchy(&mut pass, meta, max_dim);
-                    }
-                    PassSpec::OffsetHerarchy => {
-                        self.run_offset_hierarchy(&mut pass, meta, max_dim);
-                    }
-                }
+            // QuadCell split
+            pass.set_pipeline(&self.pipelines.quadcell_split);
+            pass.set_bind_group(0, &self.bind_groups.split_quadcell[ping], &[]);
+            let [x, y, z] = split_dispatch_3d(num_cells, max_dim);
+            pass.dispatch_workgroups(x, y, z);
+
+            // Build split entries
+            pass.set_pipeline(&self.pipelines.build_split_entries);
+            pass.set_bind_group(0, &self.bind_groups.split_cell_entry[ping], &[]);
+            let [x, y, z] = dispatch_for_items(num_entries, max_dim);
+            pass.dispatch_workgroups(x, y, z);
+
+            // Winding hierarchy forward scan + backward carry
+            let winding_bgs = &self.bind_groups.winding_scan_bgs;
+            for i in 0..winding_levels.len() {
+                pass.set_pipeline(&self.pipelines.scan_winding_block);
+                pass.set_bind_group(0, &winding_bgs[i], &[]);
+                let [x, y, z] = dispatch_for_items(winding_levels[i], max_dim);
+                pass.dispatch_workgroups(x, y, z);
             }
+            for i in (0..winding_levels.len().saturating_sub(1)).rev() {
+                pass.set_pipeline(&self.pipelines.add_winding_carry);
+                pass.set_bind_group(0, &winding_bgs[i], &[]);
+                let [x, y, z] = dispatch_for_items(winding_levels[i], max_dim);
+                pass.dispatch_workgroups(x, y, z);
+            }
+
+            // Mark tail winding offsets
+            pass.set_pipeline(&self.pipelines.mark_tail_winding_offsets);
+            pass.set_bind_group(0, &self.bind_groups.mark_tail, &[]);
+            let [x, y, z] = dispatch_for_items(num_entries, max_dim);
+            pass.dispatch_workgroups(x, y, z);
+
+            // Offset hierarchy forward scan + backward carry
+            let offset_bgs = &self.bind_groups.offset_scan_bgs;
+            for i in 0..offset_levels.len() {
+                pass.set_pipeline(&self.pipelines.scan_offset_block);
+                pass.set_bind_group(0, &offset_bgs[i], &[]);
+                let [x, y, z] = dispatch_for_items(offset_levels[i], max_dim);
+                pass.dispatch_workgroups(x, y, z);
+            }
+            for i in (0..offset_levels.len().saturating_sub(1)).rev() {
+                pass.set_pipeline(&self.pipelines.add_offset_carry);
+                pass.set_bind_group(0, &offset_bgs[i], &[]);
+                let [x, y, z] = dispatch_for_items(offset_levels[i], max_dim);
+                pass.dispatch_workgroups(x, y, z);
+            }
+
+            // Emit cell entries (writes to cell_entries buffer in-place)
+            pass.set_pipeline(&self.pipelines.emit_cell_entries);
+            pass.set_bind_group(0, &self.bind_groups.emit_result, &[]);
+            let [x, y, z] = dispatch_for_items(num_offsets, max_dim);
+            pass.dispatch_workgroups(x, y, z);
+
+            // Update metadata: write entry_start/entry_count into cell_metadata_out.
+            // Actual result count is only known on GPU (result_info), so dispatch by
+            // max_result_entries as upper bound; shader early-returns for out-of-range threads.
+            pass.set_pipeline(&self.pipelines.update_metadata);
+            pass.set_bind_group(0, &self.bind_groups.update_metadata[ping], &[]);
+            let [x, y, z] = split_dispatch_3d(max_result_entries.max(1), max_dim);
+            pass.dispatch_workgroups(x, y, z);
         }
         self.queue.submit([encoder.finish()]);
     }
@@ -774,8 +943,8 @@ impl CellEntryGpuContext {
 
     pub fn read_cell_entry(&self) -> anyhow::Result<Vec<CellEntry>> {
         self.readback::<CellEntry>(
-            &self.resources.result_cell_entries_buffer,
-            &self.resources.result_entries_readback_buffer,
+            &self.resources.cell_entries_buffer,
+            &self.resources.cell_entry_readback_buffer,
         )
     }
 
@@ -785,6 +954,18 @@ impl CellEntryGpuContext {
             &self.resources.result_info_readback_buffer,
         )?;
         Ok(res[0])
+    }
+
+    /// Read cell metadata from the output buffer after all levels have been processed.
+    /// The last process_level call uses depth = max_depth - 1, whose output goes to:
+    ///   even last_depth -> buffer_2, odd last_depth -> buffer_1
+    pub fn read_cell_metadata(&self, last_depth: u8) -> anyhow::Result<Vec<CellMetadata>> {
+        let source_buffer = if last_depth % 2 == 0 {
+            &self.resources.cell_metadata_buffer_2
+        } else {
+            &self.resources.cell_metadata_buffer_1
+        };
+        self.readback::<CellMetadata>(source_buffer, &self.resources.cell_metadata_readback_buffer)
     }
 
     pub fn read_winding_block_sums(&self) -> anyhow::Result<Vec<Vec<WindingBlockInfo>>> {

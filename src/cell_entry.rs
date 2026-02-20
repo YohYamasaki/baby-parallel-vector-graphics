@@ -1,7 +1,5 @@
 use crate::abstract_segment::AbstractLineSegment;
 use crate::geometry::rect::Rect;
-use crate::gpu::subdivide_cell_entry::{CellEntryGpuContext, ParentCellBound};
-use crate::quad_tree::TL_IDX;
 use bytemuck::{Pod, Zeroable};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -449,7 +447,7 @@ impl Default for CellEntry {
             seg_idx: NONE_U32,
             path_idx: u32::MAX,
             data: 0,
-            cell_pos: TL_IDX,
+            cell_pos: 0,
             cell_id: u32::MAX, // dummy, this will be generated after cell entry subdivision
             _pad: [0; 2],
         }
@@ -465,7 +463,7 @@ pub struct SplitEntry {
     pub unique_id: u32,
     pub seg_idx: u32, // For abstract entry
     pub path_idx: u32,
-    pub _pad: u32,
+    pub parent_cell_id: u32, // Propagated from entry.cell_id to track parent cell across subdivision
 }
 
 /// create a very first SegmentEntry, no splitting required.
@@ -483,7 +481,7 @@ pub fn init_root_cell_entries(abs_segments: &[AbstractLineSegment]) -> Vec<CellE
             seg_idx: i as u32,
             path_idx: curr.path_idx,
             data: 0,
-            cell_pos: TL_IDX, // whatever is OK
+            cell_pos: 0, // whatever is OK
             cell_id: 0,
             _pad: [0; 2],
         });
@@ -518,7 +516,7 @@ pub fn build_split_entries(
                 unique_id,
                 seg_idx,
                 path_idx: seg.path_idx,
-                _pad: 0,
+                parent_cell_id: entry.cell_id,
             });
         }
 
@@ -534,7 +532,7 @@ pub fn build_split_entries(
                 unique_id,
                 seg_idx: NONE_U32,
                 path_idx: entry.path_idx,
-                _pad: 0,
+                parent_cell_id: entry.cell_id,
             });
         }
     }
@@ -647,7 +645,7 @@ pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) 
                         seg_idx: curr.seg_idx,
                         path_idx: curr.path_idx,
                         cell_pos: cell,
-                        cell_id: curr.unique_id, // This will be provided after cell entry subdivision
+                        cell_id: curr.parent_cell_id * 4 + cell, // child cell_id = parent * 4 + cell_pos
                         _pad: [0; 2],
                     };
                     cursor += 1;
@@ -659,7 +657,7 @@ pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) 
                         seg_idx: NONE_U32,
                         path_idx: curr.path_idx,
                         cell_pos: cell,
-                        cell_id: curr.unique_id, // This will be provided after cell entry subdivision
+                        cell_id: curr.parent_cell_id * 4 + cell, // child cell_id = parent * 4 + cell_pos
                         _pad: [0; 2],
                     };
                 }
@@ -671,7 +669,7 @@ pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) 
     cell_entries
 }
 
-/// Execute Kernel 1 ~ 4 of 4.2 Parallel Subdivision.
+/// Execute Kernel 1 ~ 4 of 4.2 Parallel Subdivision on CPU.
 pub fn subdivide_cell_entry(
     cell_entries: &mut [CellEntry],
     parent_bound: &Rect,
@@ -705,31 +703,11 @@ pub fn subdivide_cell_entry(
     // println!();
 
     // println!("===== CPU: Result =====");
-    // let next_cell_entries = split_to_cell_entry(&mut split_entries, out_vec_size);
+    let next_cell_entries = split_to_cell_entry(&mut split_entries, out_vec_size);
     // print_entries(&next_cell_entries, |e| e.cell_id);
     // println!();
 
-    // GPU cell splitting test
-    let parent_bound = ParentCellBound::new(&parent_bound);
-    let gpu_context = pollster::block_on(CellEntryGpuContext::new(
-        &cell_entries,
-        &abs_segments,
-        &parent_bound,
-    ))?;
-    gpu_context.run_subdivision();
-    let result_info = gpu_context.read_result_info()?;
-    let num_cells = result_info.cell_entries_length as usize;
-    let mut result_cells = gpu_context.read_cell_entry()?;
-    result_cells.truncate(num_cells);
-    // gpu_context.print_winding_block_sums()?;
-    gpu_context.print_split_entries()?;
-    gpu_context.print_offsets()?;
-
-    println!("=== GPU: Result ===");
-    print_entries(&result_cells, |e| e.cell_id);
-
-    // Ok(next_cell_entries)
-    Ok(result_cells)
+    Ok(next_cell_entries)
 }
 
 fn print_entries<T: Debug>(entries: &[T], mut cell_pos: impl FnMut(&T) -> u32) {

@@ -9,18 +9,18 @@ const BOTTOM_RIGHT: u32 = 3;
 const ABSTRACT: u32 = 1 << 0;
 const WINDING_INCREMENT: u32 = 1 << 3;
 
-struct ParentCellBound {
+struct CellMetadata {
     bbox_ltrb: vec4<f32>,
-    mid_x: f32,
-    mid_y: f32,
-    _pad: vec2<u32>
+    mid: vec2<f32>,
+    entry_start: u32,
+    entry_count: u32,
 }
 
 struct WindingBlockInfo {
     first_path_idx: u32,
     last_path_idx: u32,
-    all_same_path: u32,
-    _pad: u32,
+    first_cell_id: u32,
+    last_cell_id: u32,
     tail_winding: vec4<i32>,
 }
 
@@ -61,7 +61,7 @@ struct SplitEntry {
     unique_id: u32,
     seg_idx: u32, // For abstract entry
     path_idx: u32,
-    _pad: u32
+    parent_cell_id: u32, // Propagated from entry.cell_id to track parent cell across subdivision
 }
 
 struct EdgeIntersectionInfo {
@@ -439,8 +439,10 @@ fn build_split_data(
 /// Kernel 1 of 4.2 Parallel subdivision
 /// Assuming parent_entries already ordered SEGMENTs - WINDING for each cell.
 fn build_split_entries(idx: u32) {
-    let n = arrayLength(&cell_entries);
+    // Read the actual entry count written by process_level() before this dispatch.
+    let n = result_info[0].cell_entries_length;
     let entry = cell_entries[idx];
+    let metadata = cell_metadata[entry.cell_id];
     let is_abstract_entry = (entry.entry_type & ABSTRACT) != 0;
     let is_winding_inc_entry = (entry.entry_type & WINDING_INCREMENT) != 0;
 
@@ -449,17 +451,17 @@ fn build_split_entries(idx: u32) {
         let seg = segments[seg_idx];
         let edge_info = get_edge_intersection_info(
             seg,
-            parent_bound.bbox_ltrb,
-            parent_bound.mid_x,
-            parent_bound.mid_y
+            metadata.bbox_ltrb,
+     metadata.mid[0],
+     metadata.mid[1]
         );
         let split_data = build_split_data(
             seg,
             entry.data,
             edge_info,
-            parent_bound.bbox_ltrb,
-            parent_bound.mid_x,
-            parent_bound.mid_y
+            metadata.bbox_ltrb,
+     metadata.mid[0],
+     metadata.mid[1]
         );
 
         // Add offsets (if a child cell intersects with the segment, add 1 to the offset)
@@ -473,15 +475,16 @@ fn build_split_entries(idx: u32) {
         split_entry.unique_id = idx;
         split_entry.seg_idx = seg_idx;
         split_entry.path_idx = seg.path_idx;
-        split_entry._pad = 0u;
+        split_entry.parent_cell_id = entry.cell_id;
 
         global_split_entries[idx] = split_entry;
 
         // Keep a per-entry winding representation so block scan can start from all entries.
         var winfo = WindingBlockInfo();
-        winfo.all_same_path = 1u;
         winfo.first_path_idx = split_entry.path_idx;
         winfo.last_path_idx = split_entry.path_idx;
+        winfo.first_cell_id = entry.cell_id;
+        winfo.last_cell_id = entry.cell_id;
         winfo.tail_winding = split_data.winding;
         winding_infos[idx] = winfo;
     }
@@ -499,6 +502,7 @@ fn build_split_entries(idx: u32) {
         split_entry.unique_id = idx;
         split_entry.seg_idx = NONE_U32;
         split_entry.path_idx = entry.path_idx;
+        split_entry.parent_cell_id = entry.cell_id;
 
         global_split_entries[idx] = split_entry;
         global_cell_offsets[TOP_LEFT * n + idx] = 0u;
@@ -508,33 +512,41 @@ fn build_split_entries(idx: u32) {
 
         // Keep the same representation for winding increment entries.
         var winfo = WindingBlockInfo();
-        winfo.all_same_path = 1u;
         winfo.first_path_idx = entry.path_idx;
         winfo.last_path_idx = entry.path_idx;
+        winfo.first_cell_id = entry.cell_id;
+        winfo.last_cell_id = entry.cell_id;
         winfo.tail_winding = split_data.winding;
         winding_infos[idx] = winfo;
     }
 }
 
 
+struct SplitResultInfo {
+    cell_entries_length: u32,
+}
+
 @group(0) @binding(0) var<storage, read_write> cell_entries: array<CellEntry>;
 @group(0) @binding(1) var<storage, read> segments: array<AbstractLineSegment>;
-@group(0) @binding(2) var<uniform> parent_bound: ParentCellBound;
+@group(0) @binding(2) var<storage, read> cell_metadata: array<CellMetadata>;
 @group(0) @binding(3) var<storage, read_write> global_split_entries: array<SplitEntry>;
 @group(0) @binding(4) var<storage, read_write> global_cell_offsets: array<u32>;
 @group(0) @binding(5) var<storage, read_write> winding_infos: array<WindingBlockInfo>;
+// result_info[0].cell_entries_length holds the actual number of entries for the current depth,
+// written by process_level() before this shader runs.
+@group(0) @binding(6) var<storage, read_write> result_info: array<SplitResultInfo>;
 
 @compute
 @workgroup_size(WG_SIZE)
 fn main(
-    @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(num_workgroups) num_wg: vec3<u32>,
 ) {
     let wg_linear = linearize_workgroup_id(wid, num_wg);
     let idx = wg_linear * WG_SIZE + lid.x;
-    let entries_length = arrayLength(&cell_entries);
+    // Read the actual entry count for the current depth from result_info.
+    let entries_length = result_info[0].cell_entries_length;
     let in_range = idx < entries_length;
 
     if (in_range) {

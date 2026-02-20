@@ -25,7 +25,7 @@ struct SplitEntry {
     unique_id: u32,
     seg_idx: u32, // For abstract entry
     path_idx: u32,
-    _pad: u32
+    parent_cell_id: u32, // Propagated from entry.cell_id to track parent cell across subdivision
 }
 struct ParentCellBound {
     bbox_ltrb: vec4<f32>,
@@ -107,10 +107,13 @@ fn main(
 ) {
     let wg_linear = linearize_workgroup_id(wid, num_wg);
     let offset_idx = wg_linear * WG_SIZE + lid.x; // global idx for cell_offsets
-    let offsets_length = arrayLength(&cell_offsets);
 
+    let num_entries = result_info[0].cell_entries_length;
+    if (num_entries == 0u) {
+        return;
+    }
+    let offsets_length = num_entries * 4u;
     let in_range = offset_idx < offsets_length;
-    let num_entries = arrayLength(&split_entries);
     let split_idx  = offset_idx % num_entries;
     let cell_pos = offset_idx / num_entries;
 
@@ -121,7 +124,10 @@ fn main(
 
         var is_path_tail = split_idx == num_entries - 1u;
         if (!is_path_tail) {
-            is_path_tail = split_entries[split_idx + 1u].path_idx != split_entry.path_idx;
+            let next_entry = split_entries[split_idx + 1u];
+            is_path_tail =
+                next_entry.path_idx != split_entry.path_idx ||
+                next_entry.parent_cell_id != split_entry.parent_cell_id;
         }
 
         let emit_seg = has_fill(split_info, cell_pos) == 1u;
@@ -148,6 +154,7 @@ fn main(
                 cell_entry.seg_idx = split_entry.seg_idx;
                 cell_entry.path_idx = split_entry.path_idx;
                 cell_entry.cell_pos = cell_pos;
+                cell_entry.cell_id = split_entry.parent_cell_id * 4u + cell_pos;
                 cell_entries[out_idx] = cell_entry;
                 out_idx++;
             }
@@ -159,6 +166,7 @@ fn main(
                 cell_entry.seg_idx = NONE_U32;
                 cell_entry.path_idx = split_entry.path_idx;
                 cell_entry.cell_pos = cell_pos;
+                cell_entry.cell_id = split_entry.parent_cell_id * 4u + cell_pos;
                 cell_entries[out_idx] = cell_entry;
             }
         }
