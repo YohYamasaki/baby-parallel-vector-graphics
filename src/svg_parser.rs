@@ -1,10 +1,11 @@
 use crate::abstract_segment::{AbstractLineSegment, SegType};
 use crate::create_paint_array;
 use crate::path::{AbstractPath, Paint};
+use anyhow::Context;
+use crate::geometry::rect::Rect;
 use std::fs;
 use usvg::tiny_skia_path::{PathSegment, Point};
 use usvg::{Group, Node, Path};
-use crate::geometry::rect::Rect;
 
 pub fn create_abstract_segment_array(
     abs_segments: &mut Vec<AbstractLineSegment>,
@@ -58,7 +59,15 @@ pub fn visit_group(g: &Group, paths: &mut Vec<Path>) {
     }
 }
 
-pub fn parse_svg() -> anyhow::Result<(Vec<AbstractPath>, Vec<AbstractLineSegment>, Vec<Paint>)> {
+pub struct ParsedSvg {
+    pub abs_paths: Vec<AbstractPath>,
+    pub abs_segments: Vec<AbstractLineSegment>,
+    pub paints: Vec<Paint>,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn parse_svg() -> anyhow::Result<ParsedSvg> {
     let mut paths: Vec<Path> = vec![];
     let mut abs_paths: Vec<AbstractPath> = vec![];
     let mut abs_segments: Vec<AbstractLineSegment> = vec![];
@@ -88,5 +97,17 @@ pub fn parse_svg() -> anyhow::Result<(Vec<AbstractPath>, Vec<AbstractLineSegment
         seg_start_idx = seg_end_idx;
         create_paint_array(&mut paints, path);
     }
-    Ok((abs_paths, abs_segments, paints))
+    let svg_size = svg_tree.size();
+    let width = svg_size.width().ceil().max(1.0) as u32;
+    let height = svg_size.height().ceil().max(1.0) as u32;
+    let _ = Rect::from_ltrb(0.0, 0.0, width as f32, height as f32)
+        .context("Invalid parsed SVG size")?;
+
+    Ok(ParsedSvg {
+        abs_paths,
+        abs_segments,
+        paints,
+        width,
+        height,
+    })
 }
