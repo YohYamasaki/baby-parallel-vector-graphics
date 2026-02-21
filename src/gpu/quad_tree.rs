@@ -11,6 +11,8 @@ pub struct CellMetadata {
     mid: [f32; 2],
     entry_start: u32,
     entry_count: u32,
+    abstract_count: u32,
+    _pad: [u32; 3],
 }
 
 impl CellMetadata {
@@ -20,6 +22,9 @@ impl CellMetadata {
             mid: rect.mid_point(),
             entry_start,
             entry_count,
+            // Root starts from abstract entries only; child cells are updated on GPU.
+            abstract_count: entry_count,
+            _pad: [0; 3],
         }
     }
 
@@ -35,7 +40,6 @@ impl CellMetadata {
         self.entry_count
     }
 
-    /// Reconstruct a Rect from the stored bbox_ltrb.
     pub fn bbox_rect(&self) -> Rect {
         Rect::from_ltrb(
             self.bbox_ltrb[0],
@@ -62,14 +66,13 @@ pub fn build_quadtree(
     ))?;
 
     let mut num_cells = 1u32;
-    // Start with the initial entry count; updated after each level via GPU readback.
     let mut num_entries = root_entries.len() as u32;
 
     for depth in 0..max_depth {
         gpu_ctx.process_level(depth, num_cells, num_entries);
 
-        // Read back the actual output entry count so the next level dispatches correctly.
-        // This CPU-GPU sync is necessary because the GPU emits a variable number of entries.
+        // Read back the actual output entry count; needed because the GPU emits a
+        // variable number of entries and the next dispatch must use the correct size.
         let result_info = gpu_ctx.read_result_info()?;
         num_entries = result_info.cell_entries_length;
         num_cells *= 4;
