@@ -560,23 +560,25 @@ pub fn consolidate_winding_inc(split_entries: &mut Vec<SplitEntry>) {
 /// Kernel 3 of 4.2 Parallel subdivision.
 /// - Mutate entries.
 /// - Assumes entries are ordered by path.
-/// - Computes global exclusive offsets in (path -> child -> entry) order, without expanding lanes.
+/// - Computes global exclusive offsets in (child -> path -> entry) order.
+/// - Outer loop is child cell so that same-cell entries are contiguous in the output,
+///   which is required by group_by_cell_pos in the quad-tree builder.
 pub fn update_to_global_offset(entries: &mut [SplitEntry]) -> u32 {
     assert!(!entries.is_empty());
 
     let mut sum: u32 = 0;
-    let mut start = 0usize;
-    while start < entries.len() {
-        // Find the start and tail entries in the same path
-        let path = entries[start].path_idx;
-        let mut end = start + 1;
-        while end < entries.len() && entries[end].path_idx == path {
-            end += 1;
-        }
-        let tail = end - 1; // last entry in this path
 
-        // For each child cell, scan the lanes for this path
-        for &cell in &[TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT] {
+    for &cell in &[TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT] {
+        let mut start = 0usize;
+        while start < entries.len() {
+            // Find the start and tail entries in the same path
+            let path = entries[start].path_idx;
+            let mut end = start + 1;
+            while end < entries.len() && entries[end].path_idx == path {
+                end += 1;
+            }
+            let tail = end - 1;
+
             for i in start..end {
                 let split_info = entries[i].split_data.split_info;
                 let seg_out = has_fill(split_info, cell) as u32;
@@ -585,15 +587,12 @@ pub fn update_to_global_offset(entries: &mut [SplitEntry]) -> u32 {
                 let winc_out =
                     (is_tail && entries[i].split_data.winding[cell as usize] != 0) as u32;
 
-                // exclusive offset for this lane
                 entries[i].offsets[cell as usize] = sum;
-
-                // advance global sum by how many outputs this lane will emit
                 sum += seg_out + winc_out;
             }
-        }
 
-        start = end;
+            start = end;
+        }
     }
     sum
 }
@@ -604,17 +603,17 @@ pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) 
     assert!(split_entries.last().is_some());
     let mut cell_entries: Vec<CellEntry> = vec![CellEntry::default(); out_vec_size as usize];
 
-    let mut start = 0;
-    while start < split_entries.len() {
-        let path = split_entries[start].path_idx;
-        let mut end = start + 1;
-        while end < split_entries.len() && split_entries[end].path_idx == path {
-            end += 1;
-        }
-        let tail = end - 1;
+    for &cell in &[TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT] {
+        let ci = cell as usize;
+        let mut start = 0;
+        while start < split_entries.len() {
+            let path = split_entries[start].path_idx;
+            let mut end = start + 1;
+            while end < split_entries.len() && split_entries[end].path_idx == path {
+                end += 1;
+            }
+            let tail = end - 1;
 
-        for &cell in &[TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT] {
-            let ci = cell as usize;
             for i in start..end {
                 let curr = &split_entries[i];
                 let next = if i + 1 < end {
@@ -645,7 +644,7 @@ pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) 
                         seg_idx: curr.seg_idx,
                         path_idx: curr.path_idx,
                         cell_pos: cell,
-                        cell_id: curr.parent_cell_id * 4 + cell, // child cell_id = parent * 4 + cell_pos
+                        cell_id: curr.parent_cell_id * 4 + cell,
                         _pad: [0; 2],
                     };
                     cursor += 1;
@@ -657,14 +656,14 @@ pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) 
                         seg_idx: NONE_U32,
                         path_idx: curr.path_idx,
                         cell_pos: cell,
-                        cell_id: curr.parent_cell_id * 4 + cell, // child cell_id = parent * 4 + cell_pos
+                        cell_id: curr.parent_cell_id * 4 + cell,
                         _pad: [0; 2],
                     };
                 }
             }
-        }
 
-        start = end;
+            start = end;
+        }
     }
     cell_entries
 }
