@@ -22,9 +22,8 @@ pub type CellId = u32;
 fn half_open_eval(seg: &AbstractLineSegment, sample: &Point) -> i32 {
     let [left, top, right, bottom] = seg.bbox_ltrb;
 
-    // Outside vertical bbox range?
+    // Outside the segment's vertical bbox: use a clipped constant sign.
     if sample.y > bottom || sample.y <= top {
-        // Only meaningful if x is inside bbox range; otherwise 0.
         if !(left <= sample.x && sample.x < right) {
             return 0;
         }
@@ -41,7 +40,7 @@ fn half_open_eval(seg: &AbstractLineSegment, sample: &Point) -> i32 {
         };
     }
 
-    // Within vertical range: classify by x against bbox.
+    // Within vertical range: classify by x position relative to bbox.
     if sample.x >= right {
         return 1;
     }
@@ -49,7 +48,7 @@ fn half_open_eval(seg: &AbstractLineSegment, sample: &Point) -> i32 {
         return -1;
     }
 
-    // Within bbox: optional hull check.
+    // Inside bbox: try convex hull, then fall back to implicit evaluation.
     let check = seg.hit_chull(sample);
     if check != -1 {
         return if check == 1 { -1 } else { 1 };
@@ -104,7 +103,8 @@ struct EdgeIntersectionInfo {
 
 impl EdgeIntersectionInfo {
     pub fn new(seg: &AbstractLineSegment, parent_bound: &Rect, mid_point: &Point) -> Self {
-        let far_x = parent_bound.right() + (parent_bound.width() + 1.0) * 1024.0; // TODO: 無限遠のレイ用の関数を作る
+        // Extend a ray far beyond the right boundary for winding number evaluation.
+        let far_x = parent_bound.right() + (parent_bound.width() + 1.0) * 1024.0;
         let sign_l = half_open_eval(
             &seg,
             &Point {
@@ -267,15 +267,11 @@ impl SplitData {
         bound: &Rect,
         mid_point: &Point,
     ) -> Self {
-        // TODO: should we do split contain check in here? We can do it outside of this fn
-        // we can use AbstractLineSegment::is_inside_bb
-        // TODO: probably??
         let going_up = if seg.y0 > seg.y1 { 1 } else { -1 };
         let going_right = if seg.x0 < seg.x1 { 1 } else { -1 };
         let mut split_info = 0u32;
         let mut winding = [0i32; 4];
 
-        // endpoints inside parent quad must mark child occupancy.
         let classify_child = |x: f32, y: f32| -> u32 {
             if x <= mid_point.x {
                 if y <= mid_point.y {
@@ -292,6 +288,7 @@ impl SplitData {
         let contains_in_parent = |x: f32, y: f32| -> bool {
             x >= bound.left() && x <= bound.right() && y >= bound.top() && y <= bound.bottom()
         };
+        // Endpoints inside the parent quad mark their child cell as occupied.
         if contains_in_parent(seg.x0, seg.y0) {
             split_info |= fill(classify_child(seg.x0, seg.y0));
         }
@@ -426,17 +423,16 @@ impl SplitData {
     }
 }
 
-/// Minimal representation of the entries in a quad cell. Metadata of the cell itself is stored in QuadCell.
+/// Per-entry record stored in a quad cell.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct CellEntry {
     pub entry_type: u32,
-    pub data: i32,    // winding -> winding increment, segment -> shortcut
-    pub seg_idx: u32, // For abstract entry
+    pub data: i32,    // WINDING_INCREMENT: increment value; ABSTRACT: shortcut flag
+    pub seg_idx: u32, // Index into abs_segments; only valid for ABSTRACT entries
     pub path_idx: u32,
-
-    pub cell_pos: u32, // Use BOTTOM_LEFT ~ TOP_RIGHT
-    pub cell_id: u32,  // This will be provided after cell entry subdivision
+    pub cell_pos: u32,
+    pub cell_id: u32,
     pub _pad: [u32; 2],
 }
 
@@ -448,40 +444,36 @@ impl Default for CellEntry {
             path_idx: u32::MAX,
             data: 0,
             cell_pos: 0,
-            cell_id: u32::MAX, // dummy, this will be generated after cell entry subdivision
+            cell_id: u32::MAX,
             _pad: [0; 2],
         }
     }
 }
 
-/// Intermediate representation of the parallel splitting
+/// Intermediate per-entry state used during parallel subdivision (section 4.2).
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct SplitEntry {
-    split_data: SplitData, // 32 bytes
+    split_data: SplitData,
     pub offsets: [u32; 4],
     pub unique_id: u32,
-    pub seg_idx: u32, // For abstract entry
+    pub seg_idx: u32,
     pub path_idx: u32,
-    pub parent_cell_id: u32, // Propagated from entry.cell_id to track parent cell across subdivision
+    /// cell_id of the parent; carries the parent's identity into child entries.
+    pub parent_cell_id: u32,
 }
 
-/// create a very first SegmentEntry, no splitting required.
+/// Build the initial flat list of ABSTRACT entries for the root cell (one per segment).
 pub fn init_root_cell_entries(abs_segments: &[AbstractLineSegment]) -> Vec<CellEntry> {
     let mut entries: Vec<_> = vec![];
     for i in 0..abs_segments.len() {
         let curr = &abs_segments[i];
-        let next = if i == abs_segments.len() - 1 {
-            None
-        } else {
-            Some(&abs_segments[i + 1])
-        };
         entries.push(CellEntry {
             entry_type: ABSTRACT,
             seg_idx: i as u32,
             path_idx: curr.path_idx,
             data: 0,
-            cell_pos: 0, // whatever is OK
+            cell_pos: 0,
             cell_id: 0,
             _pad: [0; 2],
         });
@@ -597,8 +589,7 @@ pub fn update_to_global_offset(entries: &mut [SplitEntry]) -> u32 {
     sum
 }
 
-/// Kernel 4 of 4.2 Parallel subdivision.
-/// Convert the split entry into cell entry.
+/// Kernel 4 — scatter split entries into child `CellEntry` records.
 pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) -> Vec<CellEntry> {
     assert!(split_entries.last().is_some());
     let mut cell_entries: Vec<CellEntry> = vec![CellEntry::default(); out_vec_size as usize];
@@ -675,37 +666,11 @@ pub fn subdivide_cell_entry(
     parent_mid_point: &Point,
     abs_segments: &[AbstractLineSegment],
 ) -> anyhow::Result<Vec<CellEntry>> {
-    println!("===== Target =====");
-    println!("{:?}", parent_bound);
-    println!("== Root seg entries ==");
-    print_entries(&cell_entries, |e: &CellEntry| e.cell_id);
-    println!();
-
-    let mut split_entries = build_split_entries(
-        &parent_bound,
-        &parent_mid_point,
-        cell_entries,
-        &abs_segments,
-    );
-    // println!("===== Kernel 1: CPU SPLIT =====");
-    // print_split_entries(&split_entries);
-    // println!();
-
+    let mut split_entries =
+        build_split_entries(parent_bound, parent_mid_point, cell_entries, abs_segments);
     consolidate_winding_inc(&mut split_entries);
-    // println!("===== Kernel 2 =====");
-    // print_split_entries(&split_entries);
-    // println!();
-
     let out_vec_size = update_to_global_offset(&mut split_entries);
-    // println!("===== Kernel 3 =====");
-    // print_split_entries(&split_entries);
-    // println!();
-
-    // println!("===== CPU: Result =====");
     let next_cell_entries = split_to_cell_entry(&mut split_entries, out_vec_size);
-    // print_entries(&next_cell_entries, |e| e.cell_id);
-    // println!();
-
     Ok(next_cell_entries)
 }
 

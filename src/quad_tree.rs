@@ -17,7 +17,7 @@ pub struct QuadCell {
     pub depth: u8,
     pub bbox: Rect,
     pub children: Option<[CellId; 4]>,
-    // This data will be filled once this cell is confirmed as a leaf
+    /// Set once this cell is finalised as a leaf.
     pub leaf_entry_range: Option<Range<usize>>,
 }
 #[derive(Debug)]
@@ -40,9 +40,10 @@ impl QuadTree {
     }
 }
 
-/// Build QuadTree from root CellEntry by level order.
-/// Each level processes all cells in the frontier at once, subdividing those that
-/// exceed min_seg and marking the rest as leaves.
+/// Build a quad tree by level-order subdivision.
+///
+/// Each level processes the current frontier, subdividing cells that have more
+/// than `min_seg` ABSTRACT entries and marking the rest as leaves.
 fn build_quadtree(
     root_bbox: Rect,
     root_entries: Vec<CellEntry>,
@@ -108,16 +109,10 @@ fn build_quadtree(
             });
             nodes[parent_id as usize].children = Some(child_ids);
 
-            // --- Execute subdivision ---
-            let child_entries = subdivide_cell_entry(
-                &mut parent_entries,
-                &parent_bbox,
-                &mid,
-                abs_segments,
-            )?;
+            let child_entries =
+                subdivide_cell_entry(&mut parent_entries, &parent_bbox, &mid, abs_segments)?;
 
-            // --- Group child entries by cell_pos and push to next frontier ---
-            // Output from subdivide is already sorted by cell_pos order (TL, TR, BL, BR)
+            // subdivide output is already in (TL, TR, BL, BR) order.
             for (child_id, entries) in group_by_cell_pos(child_entries, &child_ids) {
                 if !entries.is_empty() {
                     next_frontier.push((child_id, entries));
@@ -128,7 +123,7 @@ fn build_quadtree(
         frontier = next_frontier;
     }
 
-    // Finalise remaining frontier cells as leaves (max depth reached)
+    // Remaining frontier cells reached max depth; finalize them as leaves.
     for (cell_id, entries) in frontier {
         save_as_leaf(&mut nodes, &mut leaf_entries, cell_id, entries);
     }
@@ -136,7 +131,7 @@ fn build_quadtree(
     Ok((nodes, leaf_entries))
 }
 
-/// Finalise a cell as a leaf and append its entries to leaf_entries.
+/// Mark a cell as a leaf and append its entries to the global leaf entry list.
 fn save_as_leaf(
     nodes: &mut Vec<QuadCell>,
     leaf_entries: &mut Vec<CellEntry>,
@@ -148,8 +143,9 @@ fn save_as_leaf(
     nodes[cell_id as usize].leaf_entry_range = Some(start..leaf_entries.len());
 }
 
-/// Split subdivide output into groups by cell_pos.
-/// Assumes the output is already sorted by cell_pos: 0(TL), 1(TR), 2(BL), 3(BR).
+/// Partition a flat entry list into per-child groups based on `cell_pos`.
+///
+/// Assumes entries are contiguous per cell in order TL(0), TR(1), BL(2), BR(3).
 fn group_by_cell_pos(
     entries: Vec<CellEntry>,
     child_ids: &[CellId; 4],
@@ -166,7 +162,7 @@ fn group_by_cell_pos(
             }
             current_pos = Some(pos);
         }
-        entry.cell_id = child_ids[pos]; // this overwrites the dummy id from subdivision to the actual one
+        entry.cell_id = child_ids[pos];
         current_group.push(entry);
     }
     if let Some(pos) = current_pos {

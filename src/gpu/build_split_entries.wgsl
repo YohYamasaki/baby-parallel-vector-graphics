@@ -14,6 +14,8 @@ struct CellMetadata {
     mid: vec2<f32>,
     entry_start: u32,
     entry_count: u32,
+    abstract_count: u32,
+    _pad: array<u32, 3>,
 }
 
 struct WindingBlockInfo {
@@ -64,21 +66,20 @@ struct SplitEntry {
     parent_cell_id: u32, // Propagated from entry.cell_id to track parent cell across subdivision
 }
 
+// Grid layout for edge-crossing classification used in subdivision.
+//
+//   TL ---10 --- T ---11 --- TR -- 14 -- TI
+//   |            |           |
+//   7            8           9
+//   |            |           |
+//   L  --- 5 --- C --- 6 --- R  -- 13 -- I
+//   |            |           |
+//   2            3           4
+//   |            |           |
+//   BL --- 0 --- B --- 1 --- BR -- 12 -- BI
+//
+//   15 = 11 ∪ 14,  16 = 6 ∪ 13,  17 = 1 ∪ 12
 struct EdgeIntersectionInfo {
-    /*     TL ---10 --- T ---11 --- TR -- 14 -- TI
-           |            |           |
-           7            8           9
-           |            |           |
-           L  --- 5 --- C --- 6 --- R  -- 13 -- I
-           |            |           |
-           2            3           4
-           |            |           |
-           BL --- 0 --- B --- 1 --- BR -- 12 -- BI
-
-           11 and 14 -> 15
-            6 and 13 -> 16
-            1 and 12 -> 17
-    */
     cross0: bool,
     cross1: bool,
     cross2: bool,
@@ -104,25 +105,24 @@ struct EdgeIntersectionInfo {
 }
 
 fn linearize_workgroup_id(wid: vec3<u32>, num_wg: vec3<u32>) -> u32 {
-    // linear = x + y*X + z*(X*Y)
     return wid.x + wid.y * num_wg.x + wid.z * (num_wg.x * num_wg.y);
 }
 
 fn going_right(direction: u32) -> bool {
     switch (direction) {
         case 0: { return false; } // NW
-        case 1: { return true; } // NE
+        case 1: { return true; }  // NE
         case 2: { return false; } // SW
-        case 3: { return true; } // SE
-        case 4: { return true; } // Horizontal
+        case 3: { return true; }  // SE
+        case 4: { return true; }  // Horizontal
         default: { return false; }
     }
 }
 
 fn going_up(direction: u32) -> bool {
     switch (direction) {
-        case 0: { return true; } // NW
-        case 1: { return true; } // NE
+        case 0: { return true; }  // NW
+        case 1: { return true; }  // NE
         case 2: { return false; } // SW
         case 3: { return false; } // SE
         case 4: { return false; } // Horizontal
@@ -179,33 +179,28 @@ fn classify_child(x: f32, y: f32, mid_x: f32, mid_y: f32) -> u32 {
     return BOTTOM_RIGHT;
 }
 
+// Convex hull test — not yet implemented for line segments; always falls through.
 fn hit_chull() -> i32 {
-    return -1; // TODO: this is only for line segment
+    return -1;
 }
 
 fn eval(a: f32, b: f32, c: f32, x: f32, y: f32) -> f32 {
     return a * x + b * y + c;
 }
 
-// TODO: probably better to do not pass entire AbstractLineSegment
 fn half_open_eval(seg: AbstractLineSegment, sample_x: f32, sample_y: f32) -> i32 {
     let left = seg.bbox_ltrb[0];
     let top = seg.bbox_ltrb[1];
     let right = seg.bbox_ltrb[2];
     let bottom = seg.bbox_ltrb[3];
 
-    // Outside vertical bbox range?
+    // Outside the segment's vertical bbox: use a clipped constant sign.
     if sample_y > bottom || sample_y <= top {
-        // Only meaningful if x is inside bbox range; otherwise 0.
         if !(left <= sample_x && sample_x < right) {
             return 0;
         }
 
         let same_dir = going_right(seg.direction) == going_up(seg.direction);
-
-        // Above or below decides which sign to return.
-        // This early return is for avoiding running area evaluation by the implicit function of the segment,
-        // but clipping the value
         if sample_y <= top {
             return select(1, -1, same_dir);
         } else {
@@ -213,7 +208,7 @@ fn half_open_eval(seg: AbstractLineSegment, sample_x: f32, sample_y: f32) -> i32
         };
     }
 
-    // Within vertical range: classify by x against bbox.
+    // Within vertical range: classify by x position relative to bbox.
     if sample_x >= right {
         return 1;
     }
@@ -221,13 +216,12 @@ fn half_open_eval(seg: AbstractLineSegment, sample_x: f32, sample_y: f32) -> i32
         return -1;
     }
 
-    // Within bbox: optional hull check.
+    // Inside bbox: try convex hull, then fall back to implicit evaluation.
     let check = hit_chull();
     if check != -1 {
         return select(1, -1, check == 1);
     }
 
-    // Fallback to implicit evaluation sign.
     if eval(seg.a, seg.b, seg.c, sample_x, sample_y) < 0. {
         return -1;
     }
@@ -240,7 +234,8 @@ fn get_edge_intersection_info(seg: AbstractLineSegment, bbox_ltrb: vec4<f32>, mi
     let right_bound = bbox_ltrb[2];
     let bottom_bound = bbox_ltrb[3];
     let width = right_bound - left_bound;
-    let far_x = right_bound + (width + 1.0) * 1024.0; // TODO: 無限遠のレイ用の関数を作る
+    // Extend a ray far beyond the right boundary for winding number evaluation.
+    let far_x = right_bound + (width + 1.0) * 1024.0;
 
     let sign_l = half_open_eval(seg, left_bound, mid_y);
     let sign_c = half_open_eval(seg, mid_x, mid_y);
@@ -284,15 +279,12 @@ fn build_split_data(
     bbox_ltrb: vec4<f32>,
     mid_x: f32,
     mid_y: f32) -> SplitData {
-    // TODO: should we do split contain check in here? We can do it outside of this fn
-    // we can use AbstractLineSegment::is_inside_bb
-    // TODO: probably??
     let going_up = select(-1, 1, seg.y0 > seg.y1);
     let going_right = select(-1, 1, seg.x0 < seg.x1);
     var split_info = 0u;
     var winding = vec4(0, 0, 0, 0);
 
-    // endpoints inside parent quad must mark child occupancy.
+    // Endpoints inside the parent quad mark their child cell as occupied.
     if (contains_point_in_bbox(seg.x0, seg.y0, bbox_ltrb)) {
         split_info |= fill(classify_child(seg.x0, seg.y0, mid_x, mid_y));
     }
@@ -489,7 +481,6 @@ fn build_split_entries(idx: u32) {
         winding_infos[idx] = winfo;
     }
 
-    // TODO: not sure about the winding increment entry handling is correct
     if is_winding_inc_entry {
         let parent_winding = entry.data;
 
@@ -510,7 +501,6 @@ fn build_split_entries(idx: u32) {
         global_cell_offsets[BOTTOM_LEFT * n + idx] = 0u;
         global_cell_offsets[BOTTOM_RIGHT * n + idx] = 0u;
 
-        // Keep the same representation for winding increment entries.
         var winfo = WindingBlockInfo();
         winfo.first_path_idx = entry.path_idx;
         winfo.last_path_idx = entry.path_idx;
@@ -545,7 +535,6 @@ fn main(
 ) {
     let wg_linear = linearize_workgroup_id(wid, num_wg);
     let idx = wg_linear * WG_SIZE + lid.x;
-    // Read the actual entry count for the current depth from result_info.
     let entries_length = result_info[0].cell_entries_length;
     let in_range = idx < entries_length;
 

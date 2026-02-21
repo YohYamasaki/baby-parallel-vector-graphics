@@ -56,12 +56,9 @@ pub fn render(
                         if shortcut != 0 && seg.hit_shortcut(&node.bbox, x as f32, y as f32) {
                             has_shortcut = true;
                             count += shortcut as i32;
-                            // cb_left == 625.0 && cb_right == 750.0 && cb_top == 500.0 && seg_idx == 2 && x == 630 && y == 510
                         }
                     }
 
-                    // No need to consider winding increment if there is no other abstract segment in the cell
-                    // TODO: How to render a cell that does not have any segments but fully inside a path?
                     if is_winding_inc {
                         count += entry.data;
                         winc += entry.data;
@@ -105,16 +102,24 @@ pub fn render(
         }
 
         if DRAW_DEBUG_OVERLAY {
-            // QuadTree boxes
-            draw_line(left, top, right - 1, top, pixels, &line_paint);
-            draw_line(right - 1, top, right - 1, bottom - 1, pixels, &line_paint);
-            draw_line(left, bottom - 1, right - 1, bottom - 1, pixels, &line_paint);
-            draw_line(left, top, left, bottom - 1, pixels, &line_paint);
+            draw_line(left, top, right - 1, top, pixels, img_width, img_height, &line_paint);
+            draw_line(right - 1, top, right - 1, bottom - 1, pixels, img_width, img_height, &line_paint);
+            draw_line(left, bottom - 1, right - 1, bottom - 1, pixels, img_width, img_height, &line_paint);
+            draw_line(left, top, left, bottom - 1, pixels, img_width, img_height, &line_paint);
         }
     }
 }
 
-pub fn draw_line(x1: u32, y1: u32, x2: u32, y2: u32, pixels: &mut [u8], paint: &Paint) {
+pub fn draw_line(
+    x1: u32,
+    y1: u32,
+    x2: u32,
+    y2: u32,
+    pixels: &mut [u8],
+    img_width: u32,
+    img_height: u32,
+    paint: &Paint,
+) {
     let w = (x1 as i32 - x2 as i32).abs();
     let h = (y1 as i32 - y2 as i32).abs();
     let is_steep = w < h;
@@ -130,17 +135,20 @@ pub fn draw_line(x1: u32, y1: u32, x2: u32, y2: u32, pixels: &mut [u8], paint: &
         swap(&mut x1, &mut x2);
         swap(&mut y1, &mut y2);
     }
+    if x1 == x2 {
+        return;
+    }
     let mut y = y1 as f32;
     let step = (y2 as i32 - y1 as i32) as f32 / (x2 as i32 - x1 as i32) as f32;
     if let Paint::SolidColor { rgba } = paint {
         for x in x1..=x2 {
             let py = y.round() as u32;
             if is_steep {
-                set_pixel(py, x, 1000, 1000, rgba, pixels);
+                set_pixel(py, x, img_width, img_height, rgba, pixels);
             } else {
-                set_pixel(x, py, 1000, 1000, rgba, pixels);
+                set_pixel(x, py, img_width, img_height, rgba, pixels);
             }
-            y = y + step;
+            y += step;
         }
     }
 }

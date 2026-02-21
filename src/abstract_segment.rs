@@ -10,7 +10,7 @@ pub enum Direction {
     NE,
     SW,
     SE,
-    Horizontal, // TODO: split to W/E?
+    Horizontal,
 }
 
 impl Direction {
@@ -94,15 +94,12 @@ pub struct AbstractLineSegment {
     pub bbox_ltrb: [f32; 4],
 
     pub direction: u32,
-    // coefficients for implicit function: ax+by+c
+    // Coefficients for the implicit line equation ax + by + c = 0.
     a: f32,
     b: f32,
     c: f32,
-    // start point
     pub x0: f32,
-
     pub y0: f32,
-    // end point
     pub x1: f32,
     pub y1: f32,
 }
@@ -173,15 +170,15 @@ impl AbstractLineSegment {
         -1
     }
 
-    /// Returns x position of the given y.
+    /// Returns the x coordinate on the line at the given y.
     fn x_at_y(&self, y0: f32) -> Option<f32> {
         if self.a.abs() < EPS {
-            return None; // Horizontal
+            return None;
         }
         Some(-(self.b * y0 + self.c) / self.a)
     }
 
-    /// Check if the segment intersects with one of the boundaries of the given bounding box.
+    /// Returns true if the segment crosses any edge of `bb`.
     pub fn intersect_with_bb(&self, bb: &Rect) -> bool {
         let bounding_box = Rect::from_ltrb_slice(&self.bbox_ltrb);
         if self.is_inside_bb(bb) || bounding_box.unwrap().intersect(&bb).is_none() {
@@ -237,13 +234,13 @@ impl AbstractLineSegment {
             return false;
         }
         let x0 = cell.right();
-        // Use y position of the right end of the segment
+        // y of the segment endpoint with larger x (the shortcut base).
         let y0 = if self.x0 > self.x1 { self.y0 } else { self.y1 };
 
         if sample_y >= y0 {
             return false;
         }
-        if sample_x < x0 { true } else { false }
+        sample_x < x0
     }
 
     pub fn get_shortcut_base(&self) -> [f32; 2] {

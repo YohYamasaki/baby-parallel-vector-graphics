@@ -51,9 +51,9 @@ struct SplitEntry {
     split_data: SplitData,
     offsets: vec4<u32>,
     unique_id: u32,
-    seg_idx: u32, // For abstract entry
+    seg_idx: u32,
     path_idx: u32,
-    parent_cell_id: u32, // Propagated from entry.cell_id to track parent cell across subdivision
+    parent_cell_id: u32,
 }
 
 struct WindingBlockInfo {
@@ -66,7 +66,6 @@ struct WindingBlockInfo {
 }
 
 fn linearize_workgroup_id(wid: vec3<u32>, num_wg: vec3<u32>) -> u32 {
-    // linear = x + y*X + z*(X*Y)
     return wid.x + wid.y * num_wg.x + wid.z * (num_wg.x * num_wg.y);
 }
 
@@ -87,19 +86,13 @@ fn merge(a: WindingBlockInfo, b: WindingBlockInfo) -> WindingBlockInfo {
     let b_is_single_group =
         (b.first_path_idx == b.last_path_idx) &&
         (b.first_cell_id == b.last_cell_id);
-    // Prefix scan updates only the winding accumulation.
-    // Keep first/last metadata of the current entry.
     if (same_boundary && b_is_single_group) {
         out.tail_winding = a.tail_winding + b.tail_winding;
     }
     return out;
 }
 
-
-// Kernel 2 of 4.2 Parallel subdivision
-// Executes inclusive scan in this workgroup to generate the last winding per path, per cell.
-// The WindingBlockInfo array is used for both the initial winding increment data and the intermediate representation,
-// the initial WindingBlockInfo is generated in build_split_entries.wgsl.
+// Kernel 2 — Hillis-Steele inclusive scan to accumulate the final winding per (path, cell).
 fn inclusive_scan_winding_inc(lid: u32) {
     // Hillis-Steele inclusive scan
     var offset = 1u;
@@ -133,8 +126,8 @@ struct ScanParams {
 @group(0) @binding(0) var<storage, read_write> cell_entries: array<CellEntry>;
 @group(0) @binding(1) var<storage, read_write> global_split_entries: array<SplitEntry>;
 @group(0) @binding(2) var<storage, read_write> global_cell_offsets: array<u32>;
-@group(0) @binding(3) var<storage, read_write> winding_infos_1: array<WindingBlockInfo>; // windings to consolidate
-@group(0) @binding(4) var<storage, read_write> winding_infos_2: array<WindingBlockInfo>; // sum of the winding in a block
+@group(0) @binding(3) var<storage, read_write> winding_infos_1: array<WindingBlockInfo>;
+@group(0) @binding(4) var<storage, read_write> winding_infos_2: array<WindingBlockInfo>; // per-block summaries
 // result_info[0].cell_entries_length holds the actual number of entries for the current depth.
 @group(0) @binding(5) var<storage, read_write> result_info: array<SplitResultInfo>;
 @group(0) @binding(6) var<storage, read_write> scan_params: array<ScanParams>;
@@ -170,15 +163,14 @@ fn scan_winding_block(
     if (in_range) {
         wincs[lid.x] = winding_infos_1[idx];
     } else {
-      wincs[lid.x] = neutral_winc(); // to avoid undefined behaviour
-  }
+        wincs[lid.x] = neutral_winc();
+    }
     workgroupBarrier();
 
     inclusive_scan_winding_inc(lid.x);
     workgroupBarrier();
 
     if (lid.x == 0u && wg_linear < carry_len) {
-        // Build per-block summary separately from per-entry scan results.
         let last_valid_idx = block_len - 1u;
         var block_sum = WindingBlockInfo();
         block_sum.first_path_idx = wincs[0].first_path_idx;
@@ -219,8 +211,6 @@ fn add_winding_carry(
 
     let carry = winding_infos_2[carry_idx];
     var curr = winding_infos_1[idx];
-    // Carry phase should only adjust winding value.
-    // Keep first/last metadata from local scan results.
     let curr_is_single_group =
         (curr.first_path_idx == curr.last_path_idx) &&
         (curr.first_cell_id == curr.last_cell_id);
@@ -243,7 +233,6 @@ fn mark_tail_winding(
 ) {
     let wg_linear = linearize_workgroup_id(wid, num_wg);
     let idx = wg_linear * WG_SIZE + lid.x;
-    // Read the actual entry count for the current depth from result_info.
     let entries_length = result_info[0].cell_entries_length;
     let in_range = idx < entries_length;
 
@@ -252,10 +241,8 @@ fn mark_tail_winding(
     }
 
     var split_entry = global_split_entries[idx];
-    // Write back hierarchical winding scan result to split entries.
     split_entry.split_data.winding = winding_infos_1[idx].tail_winding;
 
-    // insert additional offset for winding increment entry
     var is_path_tail = idx == entries_length - 1u;
     if (!is_path_tail) {
         is_path_tail =

@@ -57,22 +57,18 @@ pub struct WindingBlockInfo {
 }
 
 struct Resources {
-    // metadata (ping-pong: depth % 2 selects input/output)
+    // Ping-pong metadata buffers: depth % 2 selects which is input vs output.
     cell_metadata_buffer_1: wgpu::Buffer,
     cell_metadata_buffer_2: wgpu::Buffer,
-    // cell entries: single buffer, Kernel 1 reads then Kernel 5 overwrites in-place
     cell_entries_buffer: wgpu::Buffer,
     segments_buffer: wgpu::Buffer,
-    // intermediates
     split_entries_buffer: wgpu::Buffer,
     cell_offsets_buffer: wgpu::Buffer,
     winding_block_sum_buffers: Vec<Buffer>,
     winding_scan_params_buffers: Vec<Buffer>,
     offset_block_sum_buffers: Vec<Buffer>,
     offset_scan_params_buffers: Vec<Buffer>,
-    // result info
     result_info_buffer: wgpu::Buffer,
-    // readbacks
     winding_block_sum_readback_buffers: Vec<Buffer>,
     split_entries_readback_buffer: wgpu::Buffer,
     cell_offsets_readback_buffer: wgpu::Buffer,
@@ -130,8 +126,8 @@ impl Resources {
             .expect("max_offsets overflow")
             .max(1);
 
-        // Single cell entries buffer: Kernel 1 finishes reading before Kernel 5 writes,
-        // so in-place overwrite is safe across dispatches.
+        // cell_entries is a single buffer: Kernel 1 reads before Kernel 5 writes,
+        // so in-place overwrite is safe.
         let cell_entries_buf_size = check_storage_size(
             "cell entries buffer",
             max_cell_entries
@@ -168,9 +164,6 @@ impl Resources {
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         });
 
-        // Intermediate structures are sized for the requested max_depth.
-        // max_split_entries: per-level input capacity.
-        // max_cell_entries: per-level output capacity (4x split entries).
         let split_entries_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("split entries buffer"),
             size: check_storage_size(
@@ -182,7 +175,7 @@ impl Resources {
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // cell_offsets: 4 interleaved arrays, each of length max_split_entries.
+        // 4 interleaved offset arrays, each of length max_split_entries.
         let cell_offsets_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("cell offsets buffer"),
             size: check_storage_size(
@@ -196,8 +189,7 @@ impl Resources {
             mapped_at_creation: false,
         });
 
-        // Create buffers for each level since the prefix sum process is done recursively the following process.
-        // Scan by blocks using Hillis-Steele -> add carry from the one previous block's last element
+        // Hierarchical winding block-sum buffers (one per level of the recursive scan).
         let create_sum_buffer = |bytes: u64| {
             let checked = check_storage_size("winding block sum buffer", bytes.max(32));
             device.create_buffer(&BufferDescriptor {
@@ -207,7 +199,6 @@ impl Resources {
                 mapped_at_creation: false,
             })
         };
-        // Winding block sum buffers sized for max_split_entries.
         let cell_entries_bytes = max_split_entries
             .checked_mul(size_of::<WindingBlockInfo>() as u64)
             .expect("winding block sum level-0 size overflow");
@@ -220,16 +211,15 @@ impl Resources {
             winding_block_sum_buffers.push(create_sum_buffer(bytes));
             level_elms = num_blocks;
         }
-        // Create sentinel buffer for the last block sum that does not require more splitting,
-        // But we don't want to create another buffer, pipeline, and bindgroup only for it
+        // Sentinel: top-level carry source is always zero.
         winding_block_sum_buffers.push(device.create_buffer_init(&BufferInitDescriptor {
             label: Some("winding block sum sentinel buffer"),
             contents: bytes_of(&[0u32; 8]), // minimum bytes of the buffer is 32
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         }));
 
-        // Hierarchical scan buffers for offsets.
-        // Level 0 uses `cell_offsets_buffer`; this vector keeps level>=1 and a sentinel.
+        // Hierarchical offset block-sum buffers. Level 0 is cell_offsets_buffer itself;
+        // this vector holds level ≥1 and a zero sentinel.
         let create_offset_sum_buffer = |bytes: u64| {
             let checked = check_storage_size("offset block sum buffer", bytes.max(size_of::<u32>() as u64));
             device.create_buffer(&BufferDescriptor {
@@ -239,7 +229,6 @@ impl Resources {
                 mapped_at_creation: false,
             })
         };
-        // Offset block sum buffers: max_offsets elements.
         let mut offset_block_sum_buffers: Vec<Buffer> = vec![];
         let mut offset_level_elms = max_offsets as usize;
         while offset_level_elms > WG_SIZE as usize {
@@ -248,7 +237,6 @@ impl Resources {
             offset_block_sum_buffers.push(create_offset_sum_buffer(bytes));
             offset_level_elms = num_blocks;
         }
-        // Sentinel for the top-level carry source.
         offset_block_sum_buffers.push(device.create_buffer_init(&BufferInitDescriptor {
             label: Some("offset block sum sentinel buffer"),
             contents: bytes_of(&[0u32; 1]),
@@ -278,15 +266,14 @@ impl Resources {
             mapped_at_creation: false,
         });
 
-        // readback buffers
         let result_entries_readback_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("debug out buffer"),
+            label: Some("cell entries readback buffer"),
             size: cell_entries_buf_size,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let split_entries_readback_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("parent bounds buffer"),
+            label: Some("split entries readback buffer"),
             size: split_entries_buffer.size(),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -323,22 +310,17 @@ impl Resources {
             .collect();
 
         Self {
-            // cell metadata
             cell_metadata_buffer_2,
             cell_metadata_buffer_1,
-            // cell entries (single buffer, in-place overwrite)
             cell_entries_buffer,
             segments_buffer,
-            // intermediates
             split_entries_buffer,
             cell_offsets_buffer,
             winding_block_sum_buffers,
             winding_scan_params_buffers,
             offset_block_sum_buffers,
             offset_scan_params_buffers,
-            // result info
             result_info_buffer,
-            // readbacks
             winding_block_sum_readback_buffers,
             cell_offsets_readback_buffer,
             split_entries_readback_buffer,
@@ -408,9 +390,6 @@ impl Pipelines {
             count: None,
         };
 
-        // winding shaders:
-        // bindings 0-4 (cell_entries, split_entries, cell_offsets, winding_1, winding_2)
-        // binding 5 (result_info), binding 6 (per-dispatch scan params)
         let winding_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("winding bind group"),
             entries: &[
@@ -572,8 +551,6 @@ impl BindGroups {
             ..
         } = pipelines;
 
-        // QuadCell split: cell_metadata ping-pong (reads parent metadata, writes child metadata).
-        // binding(2) = result_info for min_seg threshold used in split skipping.
         let split_quadcell_ping = device.create_bind_group(&BindGroupDescriptor {
             label: Some("split quadcell ping bind group"),
             layout: &quadcell_split.get_bind_group_layout(0),
@@ -593,7 +570,6 @@ impl BindGroups {
             ],
         });
 
-        // Initial Split: build_split_entries reads cell_entries + cell_metadata (ping-pong for metadata).
         let split_cell_entry_ping = device.create_bind_group(&BindGroupDescriptor {
             label: Some("split cell entry ping bind group"),
             layout: &build_split.get_bind_group_layout(0),
@@ -667,7 +643,6 @@ impl BindGroups {
             }));
         }
 
-        // Emit result: emit_cell_entries writes to cell_entries (in-place overwrite)
         let emit_result = device.create_bind_group(&BindGroupDescriptor {
             label: Some("emit result bind group"),
             layout: &emit_cell_entries.get_bind_group_layout(0),
@@ -679,13 +654,13 @@ impl BindGroups {
             ],
         });
 
-        // Update metadata: reads cell_entries, writes to output cell_metadata (ping-pong for metadata)
+        // Even depth → write to buffer_2; odd depth → write to buffer_1.
         let update_metadata_ping = device.create_bind_group(&BindGroupDescriptor {
             label: Some("update metadata ping bind group"),
             layout: &update_metadata.get_bind_group_layout(0),
             entries: &[
                 bg_entry(0, cell_entries_buffer),
-                bg_entry(1, cell_metadata_buffer_2), // even depth: metadata output is buffer_2
+                bg_entry(1, cell_metadata_buffer_2),
                 bg_entry(2, result_info_buffer),
             ],
         });
@@ -694,7 +669,7 @@ impl BindGroups {
             layout: &update_metadata.get_bind_group_layout(0),
             entries: &[
                 bg_entry(0, cell_entries_buffer),
-                bg_entry(1, cell_metadata_buffer_1), // odd depth: metadata output is buffer_1
+                bg_entry(1, cell_metadata_buffer_1),
                 bg_entry(2, result_info_buffer),
             ],
         });
@@ -778,13 +753,10 @@ impl QuadTreeGpuContext {
         })
     }
 
-    /// Process one level of quad-tree subdivision.
-    /// 1. Split quad cells (compute child bboxes and write to cell_metadata_out)
-    /// 2. Run entry subdivision kernels 1-5 (split entries among child cells)
+    /// Run one level of quad-tree subdivision on the GPU.
     ///
-    /// `num_entries` is the actual number of entries in `cell_entries_buffer` for this depth.
-    /// It is written into `result_info` before any shader runs so that shaders can read it
-    /// instead of relying on `arrayLength()`.
+    /// `num_entries` is the actual live entry count for this depth; it is written into
+    /// `result_info` before any dispatch so shaders do not have to rely on `arrayLength()`.
     pub fn process_level(&self, depth: u8, num_cells: u32, num_entries: u32) {
         let max_dim = self.device.limits().max_compute_workgroups_per_dimension;
         let ping = (depth % 2) as usize;
@@ -795,8 +767,7 @@ impl QuadTreeGpuContext {
         let offset_levels =
             hierarchical_level_counts(num_offsets, self.bind_groups.offset_scan_bgs.len());
 
-        // Write the actual entry count and min_seg threshold into result_info.
-        // This must happen before the compute encoder so the write is visible to all kernels.
+        // Write before creating the encoder so the data is visible to all kernels.
         self.queue.write_buffer(
             &self.resources.result_info_buffer,
             0,
@@ -831,10 +802,8 @@ impl QuadTreeGpuContext {
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
-        // Clear intermediate buffers from the previous level to avoid stale data.
-        // cell_offsets: 4 interleaved offset arrays, all must start at 0 before scanning.
+        // Clear intermediates from the previous level.
         encoder.clear_buffer(&self.resources.cell_offsets_buffer, 0, None);
-        // winding_block_sum level-0: initial per-entry winding accumulators must start clean.
         encoder.clear_buffer(&self.resources.winding_block_sum_buffers[0], 0, None);
 
         {
@@ -852,7 +821,6 @@ impl QuadTreeGpuContext {
             let [x, y, z] = dispatch_for_items(num_entries, max_dim);
             pass.dispatch_workgroups(x, y, z);
 
-            // Winding hierarchy forward scan + backward carry
             let winding_bgs = &self.bind_groups.winding_scan_bgs;
             for i in 0..winding_levels.len() {
                 pass.set_pipeline(&self.pipelines.scan_winding_block);
@@ -867,13 +835,11 @@ impl QuadTreeGpuContext {
                 pass.dispatch_workgroups(x, y, z);
             }
 
-            // Mark tail winding offsets
             pass.set_pipeline(&self.pipelines.mark_tail_winding_offsets);
             pass.set_bind_group(0, &self.bind_groups.mark_tail, &[]);
             let [x, y, z] = dispatch_for_items(num_entries, max_dim);
             pass.dispatch_workgroups(x, y, z);
 
-            // Offset hierarchy forward scan + backward carry
             let offset_bgs = &self.bind_groups.offset_scan_bgs;
             for i in 0..offset_levels.len() {
                 pass.set_pipeline(&self.pipelines.scan_offset_block);
@@ -888,15 +854,13 @@ impl QuadTreeGpuContext {
                 pass.dispatch_workgroups(x, y, z);
             }
 
-            // Emit cell entries (writes to cell_entries buffer in-place)
             pass.set_pipeline(&self.pipelines.emit_cell_entries);
             pass.set_bind_group(0, &self.bind_groups.emit_result, &[]);
             let [x, y, z] = dispatch_for_items(num_offsets, max_dim);
             pass.dispatch_workgroups(x, y, z);
 
-            // Update metadata: write entry_start/entry_count into cell_metadata_out.
-            // Actual result count is only known on GPU (result_info), so dispatch by
-            // max_result_entries as upper bound; shader early-returns for out-of-range threads.
+            // Dispatch by max_result_entries (upper bound); shader early-returns for
+            // out-of-range threads since the actual count is only known on the GPU.
             pass.set_pipeline(&self.pipelines.update_metadata);
             pass.set_bind_group(0, &self.bind_groups.update_metadata[ping], &[]);
             let [x, y, z] = split_dispatch_3d(max_result_entries.max(1), max_dim);
@@ -956,9 +920,9 @@ impl QuadTreeGpuContext {
         Ok(res[0])
     }
 
-    /// Read cell metadata from the output buffer after all levels have been processed.
-    /// The last process_level call uses depth = max_depth - 1, whose output goes to:
-    ///   even last_depth -> buffer_2, odd last_depth -> buffer_1
+    /// Read cell metadata from the output buffer for the given depth.
+    ///
+    /// Even `last_depth` → buffer_2, odd `last_depth` → buffer_1.
     pub fn read_cell_metadata(&self, last_depth: u8) -> anyhow::Result<Vec<CellMetadata>> {
         let source_buffer = if last_depth % 2 == 0 {
             &self.resources.cell_metadata_buffer_2

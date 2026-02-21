@@ -44,32 +44,26 @@ impl Rect {
         [self.left, self.top, self.right, self.bottom]
     }
 
-    /// Returns the left edge.
     pub fn left(&self) -> f32 {
         self.left
     }
 
-    /// Returns the top edge.
     pub fn top(&self) -> f32 {
         self.top
     }
 
-    /// Returns the right edge.
     pub fn right(&self) -> f32 {
         self.right
     }
 
-    /// Returns the bottom edge.
     pub fn bottom(&self) -> f32 {
         self.bottom
     }
 
-    /// Returns rect's X position.
     pub fn x(&self) -> f32 {
         self.left
     }
 
-    /// Returns rect's Y position.
     pub fn y(&self) -> f32 {
         self.top
     }

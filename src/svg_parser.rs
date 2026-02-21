@@ -71,10 +71,8 @@ pub fn parse_svg() -> anyhow::Result<(Vec<AbstractPath>, Vec<AbstractLineSegment
     let svg: String = fs::read_to_string(svg_path)?;
     let opt = usvg::Options::default();
     let svg_tree = usvg::Tree::from_str(&svg, &opt)?;
-    // Parse SVG to normal paths
     visit_group(svg_tree.root(), &mut paths);
 
-    // Convert paths to abstract paths, segments, paints
     let mut seg_start_idx = 0usize;
     for (i, path) in paths.iter().enumerate() {
         let seg_count = create_abstract_segment_array(&mut abs_segments, path, i as u32);
@@ -88,7 +86,6 @@ pub fn parse_svg() -> anyhow::Result<(Vec<AbstractPath>, Vec<AbstractLineSegment
             bounding_box: Rect::from_ltrb(bb.left(), bb.top(), bb.right(), bb.bottom()).unwrap(),
         });
         seg_start_idx = seg_end_idx;
-        // TODO: For now we have same number of paints as paths
         create_paint_array(&mut paints, path);
     }
     Ok((abs_paths, abs_segments, paints))

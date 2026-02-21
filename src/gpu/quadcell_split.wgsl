@@ -5,6 +5,8 @@ struct CellMetadata {
     mid: vec2<f32>,
     entry_start: u32,
     entry_count: u32,
+    abstract_count: u32,
+    _pad: array<u32, 3>,
 }
 
 struct SplitResultInfo {
@@ -43,15 +45,13 @@ fn main(
 ) {
     let cell_id = linearize_workgroup_id(wid, num_wg);
     let metadata = cell_metadata_in[cell_id];
-    let entry_count = metadata.entry_count;
     let parent_bbox = metadata.bbox_ltrb;
     let min_seg = result_info[0].min_seg;
 
-    // Split skipping: if this cell has too few entries, treat it as a leaf.
-    // Write zero-entry child placeholders so downstream kernels have valid (empty) metadata.
-    let is_leaf = entry_count <= min_seg;
+    // Use abstract_count (segments only) for leaf determination; WINDING_INCREMENT entries
+    // must not prevent a cell from being treated as a leaf.
+    let is_leaf = metadata.abstract_count <= min_seg;
 
-    // Construct child cell metadata
     let mid_x = (parent_bbox[2] + parent_bbox[0]) / 2;
     let mid_y = (parent_bbox[3] + parent_bbox[1]) / 2;
     let child_bounds = get_child_bounds(parent_bbox, mid_x, mid_y);
@@ -62,11 +62,9 @@ fn main(
         child_meta.bbox_ltrb = child_bounds[i];
         let cb = child_bounds[i];
         child_meta.mid = vec2((cb[0] + cb[2]) * 0.5, (cb[1] + cb[3]) * 0.5);
-        // entry_start / entry_count will be filled by quadcell_update_metadata after emission.
-        // For leaf cells (split skipped), they stay 0 and no entries will be emitted.
+        // entry_start and entry_count are written by quadcell_update_metadata after emission.
         child_meta.entry_start = 0u;
-        // Mark leaf children with entry_count = 0 to prevent further subdivision.
-        child_meta.entry_count = select(0u, 0u, is_leaf); // always 0; updated by update_metadata
+        child_meta.entry_count = 0u;
         cell_metadata_out[base + i] = child_meta;
     }
 }

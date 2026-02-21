@@ -23,9 +23,9 @@ struct SplitEntry {
     split_data: SplitData,
     offsets: vec4<u32>,
     unique_id: u32,
-    seg_idx: u32, // For abstract entry
+    seg_idx: u32,
     path_idx: u32,
-    parent_cell_id: u32, // Propagated from entry.cell_id to track parent cell across subdivision
+    parent_cell_id: u32,
 }
 struct ParentCellBound {
     bbox_ltrb: vec4<f32>,
@@ -51,16 +51,15 @@ struct AbstractLineSegment {
 
 struct CellEntry {
     entry_type: u32,
-    data: i32,    // winding -> winding increment, segment -> shortcut
-    seg_idx: u32, // For abstract entry
+    data: i32,
+    seg_idx: u32,
     path_idx: u32,
-    cell_pos: u32, // Use BOTTOM_LEFT ~ TOP_RIGHT
-    cell_id: u32,  // This will be provided after cell entry subdivision
+    cell_pos: u32,
+    cell_id: u32,
     _pad: array<u32, 2>
 }
 
 fn linearize_workgroup_id(wid: vec3<u32>, num_wg: vec3<u32>) -> u32 {
-    // linear = x + y*X + z*(X*Y)
     return wid.x + wid.y * num_wg.x + wid.z * (num_wg.x * num_wg.y);
 }
 
@@ -136,13 +135,10 @@ fn main(
 
         let lane_count = select(0u, 1u, emit_seg) + select(0u, 1u, emit_winc);
         if (lane_count > 0u) {
-            // cell_offsets now stores an inclusive scan result.
             var out_idx = curr_offset - lane_count;
             var cell_entry = CellEntry();
 
-            // Build CellEntry
             if (emit_seg) {
-                // Abstract segment entry
                 var shortcut = 0;
                 if (has_up(split_info, cell_pos)) {
                     shortcut = 1;
@@ -159,7 +155,6 @@ fn main(
                 out_idx++;
             }
 
-            // Winding increment entry
             if (emit_winc) {
                 cell_entry.entry_type = WINDING_INCREMENT;
                 cell_entry.data = winc;
