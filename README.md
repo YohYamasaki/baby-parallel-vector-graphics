@@ -19,8 +19,8 @@ renderer can be built on GPU compute pipelines.
 ## High-Level Pipeline
 
 1. Parse SVG into abstract line segments and path metadata.
-2. Build root cell entries.
-3. Subdivide cells on GPU (quadtree-style) and produce `CellMetadata` + `CellEntry` arrays.
+2. Build root seg entries.
+3. Subdivide cells on GPU (quadtree-style) and produce `CellMetadata` + `SegEntry` arrays.
 4. Render on GPU compute (`src/gpu/cell_render.wgsl`) into an offscreen texture.
 5. Read back GPU output and save as PNG.
 6. Also render with CPU reference path and save PNG for comparison.

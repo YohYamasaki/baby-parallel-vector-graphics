@@ -11,7 +11,7 @@ struct CellMetadata {
     _pad: array<u32, 3>,
 }
 
-struct CellEntry {
+struct SegEntry {
     entry_type: u32,
     data: i32,
     seg_idx: u32,
@@ -48,7 +48,7 @@ struct RenderParams {
 }
 
 @group(0) @binding(0) var<storage, read> cell_metadata: array<CellMetadata>;
-@group(0) @binding(1) var<storage, read> cell_entries: array<CellEntry>;
+@group(0) @binding(1) var<storage, read> seg_entries: array<SegEntry>;
 @group(0) @binding(2) var<storage, read> segments: array<AbstractLineSegment>;
 @group(0) @binding(3) var<storage, read> path_paints: array<PathPaintGpu>;
 @group(0) @binding(4) var<uniform> params: RenderParams;
@@ -126,7 +126,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (entry_idx >= end) {
                 break;
             }
-            let entry = cell_entries[entry_idx];
+            let entry = seg_entries[entry_idx];
             let is_segment = (entry.entry_type & ABSTRACT) != 0u;
             let is_winding_inc = (entry.entry_type & WINDING_INCREMENT) != 0u;
 
@@ -148,7 +148,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             var last_entry_in_path = entry_idx + 1u >= end;
             if (!last_entry_in_path) {
-                last_entry_in_path = cell_entries[entry_idx + 1u].path_idx != entry.path_idx;
+                last_entry_in_path = seg_entries[entry_idx + 1u].path_idx != entry.path_idx;
             }
             if (last_entry_in_path) {
                 if ((count & 1) != 0 && path_paint_len > 0u) {

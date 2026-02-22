@@ -10,7 +10,7 @@ const ABSTRACT: u32 = 1 << 0;
 const WINDING_INCREMENT: u32 = 1 << 3;
 
 struct SplitResultInfo {
-    cell_entries_length: u32,
+    seg_entries_length: u32,
 }
 
 struct SplitData {
@@ -49,7 +49,7 @@ struct AbstractLineSegment {
     y1: f32,
 }
 
-struct CellEntry {
+struct SegEntry {
     entry_type: u32,
     data: i32,
     seg_idx: u32,
@@ -91,7 +91,7 @@ fn has_down(split_info: u32, cell: u32) -> bool {
     return (split_info & down(cell)) != 0;
 }
 
-@group(0) @binding(0) var<storage, read_write> cell_entries: array<CellEntry>;
+@group(0) @binding(0) var<storage, read_write> seg_entries: array<SegEntry>;
 @group(0) @binding(1) var<storage, read_write> split_entries: array<SplitEntry>;
 @group(0) @binding(2) var<storage, read_write> cell_offsets: array<u32>;
 @group(0) @binding(3) var<storage, read_write> result_info: array<SplitResultInfo>;
@@ -107,7 +107,7 @@ fn main(
     let wg_linear = linearize_workgroup_id(wid, num_wg);
     let offset_idx = wg_linear * WG_SIZE + lid.x; // global idx for cell_offsets
 
-    let num_entries = result_info[0].cell_entries_length;
+    let num_entries = result_info[0].seg_entries_length;
     if (num_entries == 0u) {
         return;
     }
@@ -136,7 +136,7 @@ fn main(
         let lane_count = select(0u, 1u, emit_seg) + select(0u, 1u, emit_winc);
         if (lane_count > 0u) {
             var out_idx = curr_offset - lane_count;
-            var cell_entry = CellEntry();
+            var seg_entry = SegEntry();
 
             if (emit_seg) {
                 var shortcut = 0;
@@ -145,29 +145,29 @@ fn main(
                 } else if (has_down(split_info, cell_pos)) {
                     shortcut = -1;
                 }
-                cell_entry.entry_type = ABSTRACT;
-                cell_entry.data = shortcut;
-                cell_entry.seg_idx = split_entry.seg_idx;
-                cell_entry.path_idx = split_entry.path_idx;
-                cell_entry.cell_pos = cell_pos;
-                cell_entry.cell_id = split_entry.parent_cell_id * 4u + cell_pos;
-                cell_entries[out_idx] = cell_entry;
+                seg_entry.entry_type = ABSTRACT;
+                seg_entry.data = shortcut;
+                seg_entry.seg_idx = split_entry.seg_idx;
+                seg_entry.path_idx = split_entry.path_idx;
+                seg_entry.cell_pos = cell_pos;
+                seg_entry.cell_id = split_entry.parent_cell_id * 4u + cell_pos;
+                seg_entries[out_idx] = seg_entry;
                 out_idx++;
             }
 
             if (emit_winc) {
-                cell_entry.entry_type = WINDING_INCREMENT;
-                cell_entry.data = winc;
-                cell_entry.seg_idx = NONE_U32;
-                cell_entry.path_idx = split_entry.path_idx;
-                cell_entry.cell_pos = cell_pos;
-                cell_entry.cell_id = split_entry.parent_cell_id * 4u + cell_pos;
-                cell_entries[out_idx] = cell_entry;
+                seg_entry.entry_type = WINDING_INCREMENT;
+                seg_entry.data = winc;
+                seg_entry.seg_idx = NONE_U32;
+                seg_entry.path_idx = split_entry.path_idx;
+                seg_entry.cell_pos = cell_pos;
+                seg_entry.cell_id = split_entry.parent_cell_id * 4u + cell_pos;
+                seg_entries[out_idx] = seg_entry;
             }
         }
 
         if (offset_idx == offsets_length - 1u) {
-            result_info[0].cell_entries_length = curr_offset;
+            result_info[0].seg_entries_length = curr_offset;
         }
     }
 }

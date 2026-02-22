@@ -10,7 +10,7 @@ struct CellMetadata {
 }
 
 struct SplitResultInfo {
-    cell_entries_length: u32,
+    seg_entries_length: u32,
     min_seg: u32,
     _pad: vec2<u32>,
 }

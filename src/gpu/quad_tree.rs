@@ -1,7 +1,7 @@
 use crate::abstract_segment::AbstractLineSegment;
-use crate::cell_entry::CellEntry;
+use crate::seg_entry::SegEntry;
 use crate::geometry::rect::Rect;
-use crate::gpu::subdivide_cell_entry::QuadTreeGpuContext;
+use crate::gpu::subdivide_seg_entry::QuadTreeGpuContext;
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
@@ -52,11 +52,11 @@ impl CellMetadata {
 }
 pub fn build_quadtree(
     root_bbox: Rect,
-    root_entries: Vec<CellEntry>,
+    root_entries: Vec<SegEntry>,
     max_depth: u8,
     min_seg: usize,
     abs_segments: &[AbstractLineSegment],
-) -> anyhow::Result<(Vec<CellMetadata>, Vec<CellEntry>)> {
+) -> anyhow::Result<(Vec<CellMetadata>, Vec<SegEntry>)> {
     let gpu_ctx = pollster::block_on(QuadTreeGpuContext::new(
         &root_entries,
         abs_segments,
@@ -74,16 +74,16 @@ pub fn build_quadtree(
         // Read back the actual output entry count; needed because the GPU emits a
         // variable number of entries and the next dispatch must use the correct size.
         let result_info = gpu_ctx.read_result_info()?;
-        num_entries = result_info.cell_entries_length;
+        num_entries = result_info.seg_entries_length;
         num_cells *= 4;
     }
 
-    let mut result_cell_entries = gpu_ctx.read_cell_entry()?;
+    let mut result_seg_entries = gpu_ctx.read_seg_entry()?;
     // Last depth processed is max_depth - 1; pass it to select the correct ping-pong buffer.
     let last_depth = max_depth - 1;
     let cell_metadata = gpu_ctx.read_cell_metadata(last_depth)?;
 
     // num_entries was updated to the final level's output count after the last readback.
-    result_cell_entries.truncate(num_entries as usize);
-    Ok((cell_metadata, result_cell_entries))
+    result_seg_entries.truncate(num_entries as usize);
+    Ok((cell_metadata, result_seg_entries))
 }

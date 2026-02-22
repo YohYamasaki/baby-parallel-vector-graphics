@@ -31,7 +31,7 @@ struct AbstractLineSegment {
     y1: f32,
 }
 
-struct CellEntry {
+struct SegEntry {
     entry_type: u32,
     data: i32,    // winding -> winding increment, segment -> shortcut
     seg_idx: u32, // For abstract entry
@@ -114,7 +114,7 @@ fn inclusive_scan_winding_inc(lid: u32) {
 }
 
 struct SplitResultInfo {
-    cell_entries_length: u32,
+    seg_entries_length: u32,
 }
 
 struct ScanParams {
@@ -123,12 +123,12 @@ struct ScanParams {
     _pad: vec2<u32>,
 }
 
-@group(0) @binding(0) var<storage, read_write> cell_entries: array<CellEntry>;
+@group(0) @binding(0) var<storage, read_write> seg_entries: array<SegEntry>;
 @group(0) @binding(1) var<storage, read_write> global_split_entries: array<SplitEntry>;
 @group(0) @binding(2) var<storage, read_write> global_cell_offsets: array<u32>;
 @group(0) @binding(3) var<storage, read_write> winding_infos_1: array<WindingBlockInfo>;
 @group(0) @binding(4) var<storage, read_write> winding_infos_2: array<WindingBlockInfo>; // per-block summaries
-// result_info[0].cell_entries_length holds the actual number of entries for the current depth.
+// result_info[0].seg_entries_length holds the actual number of entries for the current depth.
 @group(0) @binding(5) var<storage, read_write> result_info: array<SplitResultInfo>;
 @group(0) @binding(6) var<storage, read_write> scan_params: array<ScanParams>;
 
@@ -233,7 +233,7 @@ fn mark_tail_winding(
 ) {
     let wg_linear = linearize_workgroup_id(wid, num_wg);
     let idx = wg_linear * WG_SIZE + lid.x;
-    let entries_length = result_info[0].cell_entries_length;
+    let entries_length = result_info[0].seg_entries_length;
     let in_range = idx < entries_length;
 
     if (!in_range) {
@@ -246,8 +246,8 @@ fn mark_tail_winding(
     var is_path_tail = idx == entries_length - 1u;
     if (!is_path_tail) {
         is_path_tail =
-            cell_entries[idx + 1u].path_idx != cell_entries[idx].path_idx ||
-            cell_entries[idx + 1u].cell_id != cell_entries[idx].cell_id;
+            seg_entries[idx + 1u].path_idx != seg_entries[idx].path_idx ||
+            seg_entries[idx + 1u].cell_id != seg_entries[idx].cell_id;
     }
     if (is_path_tail) {
         for (var cell = 0u; cell < 4u; cell++) {

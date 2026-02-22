@@ -1,5 +1,5 @@
 use crate::abstract_segment::AbstractLineSegment;
-use crate::cell_entry::CellEntry;
+use crate::seg_entry::SegEntry;
 use crate::gpu::quad_tree::CellMetadata;
 use crate::path::{AbstractPath, Paint};
 use anyhow::Context;
@@ -157,7 +157,7 @@ impl ComputeRenderer {
         &self,
         surface: &Surface<'_>,
         cell_metadata: &[CellMetadata],
-        cell_entries: &[CellEntry],
+        seg_entries: &[SegEntry],
         segments: &[AbstractLineSegment],
         path_paints: &[PathPaintGpu],
     ) -> anyhow::Result<Vec<u8>> {
@@ -166,7 +166,7 @@ impl ComputeRenderer {
         let entries_buffer = create_storage_buffer_or_dummy(
             &self.device,
             "renderer cell entries buffer",
-            cell_entries,
+            seg_entries,
         );
         let segments_buffer =
             create_storage_buffer_or_dummy(&self.device, "renderer segments buffer", segments);
@@ -179,7 +179,7 @@ impl ComputeRenderer {
         let params = RenderParams {
             width: self.config.width,
             height: self.config.height,
-            entries_len: cell_entries.len() as u32,
+            entries_len: seg_entries.len() as u32,
             _pad: 0,
         };
         let params_buffer = self.device.create_buffer_init(&BufferInitDescriptor {

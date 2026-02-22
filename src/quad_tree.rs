@@ -1,6 +1,6 @@
 use crate::abstract_segment::AbstractLineSegment;
-use crate::cell_entry::{
-    init_root_cell_entries, subdivide_cell_entry, CellEntry, CellId, ABSTRACT,
+use crate::seg_entry::{
+    init_root_seg_entries, subdivide_seg_entry, SegEntry, CellId, ABSTRACT,
 };
 use crate::geometry::rect::Rect;
 use std::ops::Range;
@@ -23,7 +23,7 @@ pub struct QuadCell {
 #[derive(Debug)]
 pub struct QuadTree {
     pub nodes: Vec<QuadCell>,
-    pub entries: Vec<CellEntry>,
+    pub entries: Vec<SegEntry>,
 }
 
 impl QuadTree {
@@ -33,7 +33,7 @@ impl QuadTree {
         max_depth: u8,
         min_seg: usize,
     ) -> anyhow::Result<Self> {
-        let root_entries = init_root_cell_entries(&abs_segments);
+        let root_entries = init_root_seg_entries(&abs_segments);
         let (nodes, entries) =
             build_quadtree(root_bbox, root_entries, max_depth, min_seg, abs_segments)?;
         Ok(Self { nodes, entries })
@@ -46,13 +46,13 @@ impl QuadTree {
 /// than `min_seg` ABSTRACT entries and marking the rest as leaves.
 fn build_quadtree(
     root_bbox: Rect,
-    root_entries: Vec<CellEntry>,
+    root_entries: Vec<SegEntry>,
     max_depth: u8,
     min_seg: usize,
     abs_segments: &[AbstractLineSegment],
-) -> anyhow::Result<(Vec<QuadCell>, Vec<CellEntry>)> {
+) -> anyhow::Result<(Vec<QuadCell>, Vec<SegEntry>)> {
     let mut nodes: Vec<QuadCell> = Vec::new();
-    let mut leaf_entries: Vec<CellEntry> = Vec::new();
+    let mut leaf_entries: Vec<SegEntry> = Vec::new();
 
     // Root node
     let root_id: CellId = 0;
@@ -66,14 +66,14 @@ fn build_quadtree(
 
     // Frontier: list of (node_id, owned entries) pairs to process at each level.
     // When moving to GPU, replace with a flat buffer + metadata array.
-    let mut frontier: Vec<(CellId, Vec<CellEntry>)> = vec![(root_id, root_entries)];
+    let mut frontier: Vec<(CellId, Vec<SegEntry>)> = vec![(root_id, root_entries)];
 
     for depth in 0..max_depth {
         if frontier.is_empty() {
             break;
         }
 
-        let mut next_frontier: Vec<(CellId, Vec<CellEntry>)> = Vec::new();
+        let mut next_frontier: Vec<(CellId, Vec<SegEntry>)> = Vec::new();
 
         for (parent_id, mut parent_entries) in frontier {
             let abstract_count = parent_entries
@@ -110,7 +110,7 @@ fn build_quadtree(
             nodes[parent_id as usize].children = Some(child_ids);
 
             let child_entries =
-                subdivide_cell_entry(&mut parent_entries, &parent_bbox, &mid, abs_segments)?;
+                subdivide_seg_entry(&mut parent_entries, &parent_bbox, &mid, abs_segments)?;
 
             // subdivide output is already in (TL, TR, BL, BR) order.
             for (child_id, entries) in group_by_cell_pos(child_entries, &child_ids) {
@@ -134,9 +134,9 @@ fn build_quadtree(
 /// Mark a cell as a leaf and append its entries to the global leaf entry list.
 fn save_as_leaf(
     nodes: &mut Vec<QuadCell>,
-    leaf_entries: &mut Vec<CellEntry>,
+    leaf_entries: &mut Vec<SegEntry>,
     cell_id: CellId,
-    entries: Vec<CellEntry>,
+    entries: Vec<SegEntry>,
 ) {
     let start = leaf_entries.len();
     leaf_entries.extend(entries);
@@ -147,12 +147,12 @@ fn save_as_leaf(
 ///
 /// Assumes entries are contiguous per cell in order TL(0), TR(1), BL(2), BR(3).
 fn group_by_cell_pos(
-    entries: Vec<CellEntry>,
+    entries: Vec<SegEntry>,
     child_ids: &[CellId; 4],
-) -> Vec<(CellId, Vec<CellEntry>)> {
-    let mut result: Vec<(CellId, Vec<CellEntry>)> = Vec::new();
+) -> Vec<(CellId, Vec<SegEntry>)> {
+    let mut result: Vec<(CellId, Vec<SegEntry>)> = Vec::new();
     let mut current_pos: Option<usize> = None;
-    let mut current_group: Vec<CellEntry> = Vec::new();
+    let mut current_group: Vec<SegEntry> = Vec::new();
 
     for mut entry in entries {
         let pos = entry.cell_pos as usize;

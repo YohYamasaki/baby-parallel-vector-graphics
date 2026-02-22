@@ -41,7 +41,7 @@ struct AbstractLineSegment {
     y1: f32,
 }
 
-struct CellEntry {
+struct SegEntry {
     entry_type: u32,
     data: i32,    // winding -> winding increment, segment -> shortcut
     seg_idx: u32, // For abstract entry
@@ -432,8 +432,8 @@ fn build_split_data(
 /// Assuming parent_entries already ordered SEGMENTs - WINDING for each cell.
 fn build_split_entries(idx: u32) {
     // Read the actual entry count written by process_level() before this dispatch.
-    let n = result_info[0].cell_entries_length;
-    let entry = cell_entries[idx];
+    let n = result_info[0].seg_entries_length;
+    let entry = seg_entries[idx];
     let metadata = cell_metadata[entry.cell_id];
     let is_abstract_entry = (entry.entry_type & ABSTRACT) != 0;
     let is_winding_inc_entry = (entry.entry_type & WINDING_INCREMENT) != 0;
@@ -513,16 +513,16 @@ fn build_split_entries(idx: u32) {
 
 
 struct SplitResultInfo {
-    cell_entries_length: u32,
+    seg_entries_length: u32,
 }
 
-@group(0) @binding(0) var<storage, read_write> cell_entries: array<CellEntry>;
+@group(0) @binding(0) var<storage, read_write> seg_entries: array<SegEntry>;
 @group(0) @binding(1) var<storage, read> segments: array<AbstractLineSegment>;
 @group(0) @binding(2) var<storage, read> cell_metadata: array<CellMetadata>;
 @group(0) @binding(3) var<storage, read_write> global_split_entries: array<SplitEntry>;
 @group(0) @binding(4) var<storage, read_write> global_cell_offsets: array<u32>;
 @group(0) @binding(5) var<storage, read_write> winding_infos: array<WindingBlockInfo>;
-// result_info[0].cell_entries_length holds the actual number of entries for the current depth,
+// result_info[0].seg_entries_length holds the actual number of entries for the current depth,
 // written by process_level() before this shader runs.
 @group(0) @binding(6) var<storage, read_write> result_info: array<SplitResultInfo>;
 
@@ -535,7 +535,7 @@ fn main(
 ) {
     let wg_linear = linearize_workgroup_id(wid, num_wg);
     let idx = wg_linear * WG_SIZE + lid.x;
-    let entries_length = result_info[0].cell_entries_length;
+    let entries_length = result_info[0].seg_entries_length;
     let in_range = idx < entries_length;
 
     if (in_range) {

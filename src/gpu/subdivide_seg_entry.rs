@@ -1,5 +1,5 @@
 use crate::abstract_segment::AbstractLineSegment;
-use crate::cell_entry::{print_split_entries, CellEntry, SplitEntry};
+use crate::seg_entry::{print_split_entries, SegEntry, SplitEntry};
 use crate::geometry::rect::Rect;
 use crate::gpu::init::init_wgpu;
 use crate::gpu::quad_tree::CellMetadata;
@@ -30,7 +30,7 @@ fn split_dispatch_3d(workgroups_needed: u32, max_dim: u32) -> [u32; 3] {
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct SplitResultInfo {
-    pub cell_entries_length: u32,
+    pub seg_entries_length: u32,
     // Minimum entry count threshold for splitting a cell further.
     // Cells with entry_count <= min_seg are treated as leaves in quadcell_split.wgsl.
     pub min_seg: u32,
@@ -60,7 +60,7 @@ struct Resources {
     // Ping-pong metadata buffers: depth % 2 selects which is input vs output.
     cell_metadata_buffer_1: wgpu::Buffer,
     cell_metadata_buffer_2: wgpu::Buffer,
-    cell_entries_buffer: wgpu::Buffer,
+    seg_entries_buffer: wgpu::Buffer,
     segments_buffer: wgpu::Buffer,
     split_entries_buffer: wgpu::Buffer,
     cell_offsets_buffer: wgpu::Buffer,
@@ -73,14 +73,14 @@ struct Resources {
     split_entries_readback_buffer: wgpu::Buffer,
     cell_offsets_readback_buffer: wgpu::Buffer,
     cell_metadata_readback_buffer: wgpu::Buffer,
-    cell_entry_readback_buffer: wgpu::Buffer,
+    seg_entry_readback_buffer: wgpu::Buffer,
     result_info_readback_buffer: wgpu::Buffer,
 }
 
 impl Resources {
     fn new(
         device: &wgpu::Device,
-        cell_entries: &[CellEntry],
+        seg_entries: &[SegEntry],
         segments: &[AbstractLineSegment],
         max_depth: u8,
     ) -> Self {
@@ -108,10 +108,10 @@ impl Resources {
             out
         };
 
-        let initial_entries = cell_entries.len().max(1) as u64;
-        let max_cell_entries = initial_entries
+        let initial_entries = seg_entries.len().max(1) as u64;
+        let max_seg_entries = initial_entries
             .checked_mul(checked_pow4(max_depth))
-            .expect("max_cell_entries overflow")
+            .expect("max_seg_entries overflow")
             .max(1);
         let max_split_entries = if max_depth == 0 {
             initial_entries
@@ -126,17 +126,17 @@ impl Resources {
             .expect("max_offsets overflow")
             .max(1);
 
-        // cell_entries is a single buffer: Kernel 1 reads before Kernel 5 writes,
+        // seg_entries is a single buffer: Kernel 1 reads before Kernel 5 writes,
         // so in-place overwrite is safe.
-        let cell_entries_buf_size = check_storage_size(
+        let seg_entries_buf_size = check_storage_size(
             "cell entries buffer",
-            max_cell_entries
-                .checked_mul(size_of::<CellEntry>() as u64)
+            max_seg_entries
+                .checked_mul(size_of::<SegEntry>() as u64)
                 .expect("cell entries buffer size overflow"),
         );
-        let cell_entries_buffer = device.create_buffer(&BufferDescriptor {
+        let seg_entries_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("cell entries buffer"),
-            size: cell_entries_buf_size,
+            size: seg_entries_buf_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -199,11 +199,11 @@ impl Resources {
                 mapped_at_creation: false,
             })
         };
-        let cell_entries_bytes = max_split_entries
+        let seg_entries_bytes = max_split_entries
             .checked_mul(size_of::<WindingBlockInfo>() as u64)
             .expect("winding block sum level-0 size overflow");
         let mut winding_block_sum_buffers: Vec<Buffer> =
-            vec![create_sum_buffer(cell_entries_bytes)];
+            vec![create_sum_buffer(seg_entries_bytes)];
         let mut level_elms = max_split_entries as usize;
         while level_elms > WG_SIZE as usize {
             let num_blocks = level_elms.div_ceil(WG_SIZE as usize).max(1);
@@ -268,7 +268,7 @@ impl Resources {
 
         let result_entries_readback_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("cell entries readback buffer"),
-            size: cell_entries_buf_size,
+            size: seg_entries_buf_size,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -312,7 +312,7 @@ impl Resources {
         Self {
             cell_metadata_buffer_2,
             cell_metadata_buffer_1,
-            cell_entries_buffer,
+            seg_entries_buffer,
             segments_buffer,
             split_entries_buffer,
             cell_offsets_buffer,
@@ -326,7 +326,7 @@ impl Resources {
             split_entries_readback_buffer,
             result_info_readback_buffer,
             cell_metadata_readback_buffer,
-            cell_entry_readback_buffer: result_entries_readback_buffer,
+            seg_entry_readback_buffer: result_entries_readback_buffer,
         }
     }
 }
@@ -337,7 +337,7 @@ struct Pipelines {
     scan_winding_block: wgpu::ComputePipeline,
     scan_offset_block: wgpu::ComputePipeline,
     add_offset_carry: wgpu::ComputePipeline,
-    emit_cell_entries: wgpu::ComputePipeline,
+    emit_seg_entries: wgpu::ComputePipeline,
     mark_tail_winding_offsets: wgpu::ComputePipeline,
     add_winding_carry: wgpu::ComputePipeline,
     update_metadata: wgpu::ComputePipeline,
@@ -349,7 +349,7 @@ impl Pipelines {
             label: Some("quadcell split shader"),
             source: ShaderSource::Wgsl(include_str!("quadcell_split.wgsl").into()),
         });
-        let split_cell_entry_shader = device.create_shader_module(ShaderModuleDescriptor {
+        let split_seg_entry_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("split shader"),
             source: ShaderSource::Wgsl(include_str!("build_split_entries.wgsl").into()),
         });
@@ -361,9 +361,9 @@ impl Pipelines {
             label: Some("scan entry offsets shader"),
             source: ShaderSource::Wgsl(include_str!("scan_entry_offsets.wgsl").into()),
         });
-        let split_to_cell_entry_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("split to cell entry shader"),
-            source: ShaderSource::Wgsl(include_str!("split_to_cell_entry.wgsl").into()),
+        let split_to_seg_entry_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("split to seg entry shader"),
+            source: ShaderSource::Wgsl(include_str!("split_to_seg_entry.wgsl").into()),
         });
         let update_metadata_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("update metadata shader"),
@@ -426,7 +426,7 @@ impl Pipelines {
         let build_split = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("split pipeline"),
             layout: None,
-            module: &split_cell_entry_shader,
+            module: &split_seg_entry_shader,
             entry_point: None,
             compilation_options: Default::default(),
             cache: Default::default(),
@@ -474,10 +474,10 @@ impl Pipelines {
             compilation_options: Default::default(),
             cache: Default::default(),
         });
-        let emit_cell_entries = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        let emit_seg_entries = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("split to cell pipeline"),
             layout: None,
-            module: &split_to_cell_entry_shader,
+            module: &split_to_seg_entry_shader,
             entry_point: None,
             compilation_options: Default::default(),
             cache: Default::default(),
@@ -498,7 +498,7 @@ impl Pipelines {
             mark_tail_winding_offsets,
             scan_offset_block,
             add_offset_carry,
-            emit_cell_entries,
+            emit_seg_entries,
             update_metadata,
         }
     }
@@ -513,7 +513,7 @@ fn bg_entry(binding: u32, buffer: &wgpu::Buffer) -> BindGroupEntry<'_> {
 
 struct BindGroups {
     split_quadcell: [wgpu::BindGroup; 2],
-    split_cell_entry: [wgpu::BindGroup; 2],
+    split_seg_entry: [wgpu::BindGroup; 2],
     mark_tail: wgpu::BindGroup,
     offset_scan_bgs: Vec<wgpu::BindGroup>,
     emit_result: wgpu::BindGroup,
@@ -526,7 +526,7 @@ impl BindGroups {
         let Resources {
             cell_metadata_buffer_1,
             cell_metadata_buffer_2,
-            cell_entries_buffer,
+            seg_entries_buffer,
             segments_buffer,
             // intermediates
             split_entries_buffer,
@@ -546,7 +546,7 @@ impl BindGroups {
             scan_winding_block,
             mark_tail_winding_offsets,
             scan_offset_block,
-            emit_cell_entries,
+            emit_seg_entries,
             update_metadata,
             ..
         } = pipelines;
@@ -570,11 +570,11 @@ impl BindGroups {
             ],
         });
 
-        let split_cell_entry_ping = device.create_bind_group(&BindGroupDescriptor {
+        let split_seg_entry_ping = device.create_bind_group(&BindGroupDescriptor {
             label: Some("split cell entry ping bind group"),
             layout: &build_split.get_bind_group_layout(0),
             entries: &[
-                bg_entry(0, cell_entries_buffer),
+                bg_entry(0, seg_entries_buffer),
                 bg_entry(1, segments_buffer),
                 bg_entry(2, cell_metadata_buffer_1),
                 bg_entry(3, split_entries_buffer),
@@ -583,11 +583,11 @@ impl BindGroups {
                 bg_entry(6, result_info_buffer),
             ],
         });
-        let split_cell_entry_pong = device.create_bind_group(&BindGroupDescriptor {
+        let split_seg_entry_pong = device.create_bind_group(&BindGroupDescriptor {
             label: Some("split cell entry pong bind group"),
             layout: &build_split.get_bind_group_layout(0),
             entries: &[
-                bg_entry(0, cell_entries_buffer),
+                bg_entry(0, seg_entries_buffer),
                 bg_entry(1, segments_buffer),
                 bg_entry(2, cell_metadata_buffer_2),
                 bg_entry(3, split_entries_buffer),
@@ -603,7 +603,7 @@ impl BindGroups {
                 label: Some("winding scan bind group"),
                 layout: &scan_winding_block.get_bind_group_layout(0),
                 entries: &[
-                    bg_entry(0, cell_entries_buffer),
+                    bg_entry(0, seg_entries_buffer),
                     bg_entry(1, split_entries_buffer),
                     bg_entry(2, cell_offsets_buffer),
                     bg_entry(3, &winding_block_sum_buffers[i]),
@@ -618,7 +618,7 @@ impl BindGroups {
             label: Some("mark tail bind group"),
             layout: &mark_tail_winding_offsets.get_bind_group_layout(0),
             entries: &[
-                bg_entry(0, cell_entries_buffer),
+                bg_entry(0, seg_entries_buffer),
                 bg_entry(1, split_entries_buffer),
                 bg_entry(2, cell_offsets_buffer),
                 bg_entry(3, &winding_block_sum_buffers[0]),
@@ -645,9 +645,9 @@ impl BindGroups {
 
         let emit_result = device.create_bind_group(&BindGroupDescriptor {
             label: Some("emit result bind group"),
-            layout: &emit_cell_entries.get_bind_group_layout(0),
+            layout: &emit_seg_entries.get_bind_group_layout(0),
             entries: &[
-                bg_entry(0, cell_entries_buffer),
+                bg_entry(0, seg_entries_buffer),
                 bg_entry(1, split_entries_buffer),
                 bg_entry(2, cell_offsets_buffer),
                 bg_entry(3, result_info_buffer),
@@ -659,7 +659,7 @@ impl BindGroups {
             label: Some("update metadata ping bind group"),
             layout: &update_metadata.get_bind_group_layout(0),
             entries: &[
-                bg_entry(0, cell_entries_buffer),
+                bg_entry(0, seg_entries_buffer),
                 bg_entry(1, cell_metadata_buffer_2),
                 bg_entry(2, result_info_buffer),
             ],
@@ -668,7 +668,7 @@ impl BindGroups {
             label: Some("update metadata pong bind group"),
             layout: &update_metadata.get_bind_group_layout(0),
             entries: &[
-                bg_entry(0, cell_entries_buffer),
+                bg_entry(0, seg_entries_buffer),
                 bg_entry(1, cell_metadata_buffer_1),
                 bg_entry(2, result_info_buffer),
             ],
@@ -676,7 +676,7 @@ impl BindGroups {
 
         Self {
             split_quadcell: [split_quadcell_ping, split_quadcell_pong],
-            split_cell_entry: [split_cell_entry_ping, split_cell_entry_pong],
+            split_seg_entry: [split_seg_entry_ping, split_seg_entry_pong],
             mark_tail,
             winding_scan_bgs,
             offset_scan_bgs,
@@ -712,14 +712,14 @@ pub struct QuadTreeGpuContext {
     pipelines: Pipelines,
     resources: Resources,
     bind_groups: BindGroups,
-    num_cell_entries: u32,
+    num_seg_entries: u32,
     // Minimum entry count for a cell to be split further (passed to quadcell_split.wgsl).
     min_seg: u32,
 }
 
 impl QuadTreeGpuContext {
     pub async fn new(
-        cell_entries: &[CellEntry],
+        seg_entries: &[SegEntry],
         segments: &[AbstractLineSegment],
         parent_bound: &Rect,
         max_depth: u8,
@@ -728,19 +728,19 @@ impl QuadTreeGpuContext {
         let (device, queue) = init_wgpu().await;
 
         let pipelines = Pipelines::new(&device);
-        let resources = Resources::new(&device, &cell_entries, &segments, max_depth);
+        let resources = Resources::new(&device, &seg_entries, &segments, max_depth);
         let bind_groups = BindGroups::new(&device, &resources, &pipelines);
         // Write initial data
-        let root_meta = CellMetadata::new(parent_bound, 0, cell_entries.len() as u32);
+        let root_meta = CellMetadata::new(parent_bound, 0, seg_entries.len() as u32);
         queue.write_buffer(
             &resources.cell_metadata_buffer_1,
             0,
             bytemuck::cast_slice(&[root_meta]),
         );
         queue.write_buffer(
-            &resources.cell_entries_buffer,
+            &resources.seg_entries_buffer,
             0,
-            bytemuck::cast_slice(cell_entries),
+            bytemuck::cast_slice(seg_entries),
         );
         Ok(Self {
             device,
@@ -748,7 +748,7 @@ impl QuadTreeGpuContext {
             pipelines,
             resources,
             bind_groups,
-            num_cell_entries: cell_entries.len() as u32,
+            num_seg_entries: seg_entries.len() as u32,
             min_seg,
         })
     }
@@ -772,7 +772,7 @@ impl QuadTreeGpuContext {
             &self.resources.result_info_buffer,
             0,
             bytemuck::cast_slice(&[SplitResultInfo {
-                cell_entries_length: num_entries,
+                seg_entries_length: num_entries,
                 min_seg: self.min_seg,
                 _pad: [0; 2],
             }]),
@@ -817,7 +817,7 @@ impl QuadTreeGpuContext {
 
             // Build split entries
             pass.set_pipeline(&self.pipelines.build_split_entries);
-            pass.set_bind_group(0, &self.bind_groups.split_cell_entry[ping], &[]);
+            pass.set_bind_group(0, &self.bind_groups.split_seg_entry[ping], &[]);
             let [x, y, z] = dispatch_for_items(num_entries, max_dim);
             pass.dispatch_workgroups(x, y, z);
 
@@ -854,7 +854,7 @@ impl QuadTreeGpuContext {
                 pass.dispatch_workgroups(x, y, z);
             }
 
-            pass.set_pipeline(&self.pipelines.emit_cell_entries);
+            pass.set_pipeline(&self.pipelines.emit_seg_entries);
             pass.set_bind_group(0, &self.bind_groups.emit_result, &[]);
             let [x, y, z] = dispatch_for_items(num_offsets, max_dim);
             pass.dispatch_workgroups(x, y, z);
@@ -900,15 +900,15 @@ impl QuadTreeGpuContext {
             &self.resources.cell_offsets_buffer,
             &self.resources.cell_offsets_readback_buffer,
         )?;
-        println!("=== GPU: CellEntry offsets ===");
+        println!("=== GPU: SegEntry offsets ===");
         println!("{:?}", offsets);
         Ok(())
     }
 
-    pub fn read_cell_entry(&self) -> anyhow::Result<Vec<CellEntry>> {
-        self.readback::<CellEntry>(
-            &self.resources.cell_entries_buffer,
-            &self.resources.cell_entry_readback_buffer,
+    pub fn read_seg_entry(&self) -> anyhow::Result<Vec<SegEntry>> {
+        self.readback::<SegEntry>(
+            &self.resources.seg_entries_buffer,
+            &self.resources.seg_entry_readback_buffer,
         )
     }
 

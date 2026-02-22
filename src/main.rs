@@ -1,5 +1,5 @@
 mod abstract_segment;
-mod cell_entry;
+mod seg_entry;
 mod geometry;
 mod gpu;
 mod path;
@@ -9,7 +9,7 @@ mod render;
 mod svg_parser;
 
 use crate::abstract_segment::{AbstractLineSegment, SegType};
-use crate::cell_entry::init_root_cell_entries;
+use crate::seg_entry::init_root_seg_entries;
 use crate::geometry::rect::Rect;
 use crate::gpu::quad_tree::build_quadtree;
 use crate::gpu::render::{build_path_paints, ComputeRenderer};
@@ -47,8 +47,8 @@ fn main() -> anyhow::Result<()> {
     } = parsed;
 
     let root_bounds = Rect::from_ltrb(0.0, 0.0, render_width as f32, render_height as f32).unwrap();
-    let root_entries = init_root_cell_entries(&abs_segments);
-    let (metadata, cell_entry) = build_quadtree(root_bounds, root_entries, 4, 1, &abs_segments)?;
+    let root_entries = init_root_seg_entries(&abs_segments);
+    let (metadata, seg_entries) = build_quadtree(root_bounds, root_entries, 4, 1, &abs_segments)?;
     let path_paints = build_path_paints(&abs_paths, &paints);
 
     // Rendering on GPU, compute to offscreen texture + surface blit + PNG readback
@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     let gpu_pixels = renderer.render_to_rgba(
         &surface,
         &metadata,
-        &cell_entry,
+        &seg_entries,
         &abs_segments,
         &path_paints,
     )?;

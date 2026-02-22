@@ -1,5 +1,5 @@
 use crate::abstract_segment::AbstractLineSegment;
-use crate::cell_entry::{ABSTRACT, WINDING_INCREMENT};
+use crate::seg_entry::{ABSTRACT, WINDING_INCREMENT};
 use crate::path::{AbstractPath, Paint};
 use crate::quad_tree::QuadTree;
 use std::mem::swap;

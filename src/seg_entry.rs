@@ -426,7 +426,7 @@ impl SplitData {
 /// Per-entry record stored in a quad cell.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
-pub struct CellEntry {
+pub struct SegEntry {
     pub entry_type: u32,
     pub data: i32,    // WINDING_INCREMENT: increment value; ABSTRACT: shortcut flag
     pub seg_idx: u32, // Index into abs_segments; only valid for ABSTRACT entries
@@ -436,9 +436,9 @@ pub struct CellEntry {
     pub _pad: [u32; 2],
 }
 
-impl Default for CellEntry {
+impl Default for SegEntry {
     fn default() -> Self {
-        CellEntry {
+        SegEntry {
             entry_type: EMPTY,
             seg_idx: NONE_U32,
             path_idx: u32::MAX,
@@ -464,11 +464,11 @@ pub struct SplitEntry {
 }
 
 /// Build the initial flat list of ABSTRACT entries for the root cell (one per segment).
-pub fn init_root_cell_entries(abs_segments: &[AbstractLineSegment]) -> Vec<CellEntry> {
+pub fn init_root_seg_entries(abs_segments: &[AbstractLineSegment]) -> Vec<SegEntry> {
     let mut entries: Vec<_> = vec![];
     for i in 0..abs_segments.len() {
         let curr = &abs_segments[i];
-        entries.push(CellEntry {
+        entries.push(SegEntry {
             entry_type: ABSTRACT,
             seg_idx: i as u32,
             path_idx: curr.path_idx,
@@ -486,13 +486,13 @@ pub fn init_root_cell_entries(abs_segments: &[AbstractLineSegment]) -> Vec<CellE
 pub fn build_split_entries(
     parent_bound: &Rect,
     mid_point: &Point,
-    cell_entries: &mut [CellEntry],
+    seg_entries: &mut [SegEntry],
     abs_segments: &[AbstractLineSegment],
 ) -> Vec<SplitEntry> {
     let mut split_entries: Vec<SplitEntry> = vec![];
     let unique_id = NEXT_CELL_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
 
-    for entry in &mut *cell_entries {
+    for entry in &mut *seg_entries {
         let is_abstract_entry = (entry.entry_type & ABSTRACT) != 0;
         let is_winding_inc_entry = (entry.entry_type & WINDING_INCREMENT) != 0;
 
@@ -589,10 +589,10 @@ pub fn update_to_global_offset(entries: &mut [SplitEntry]) -> u32 {
     sum
 }
 
-/// Kernel 4 — scatter split entries into child `CellEntry` records.
-pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) -> Vec<CellEntry> {
+/// Kernel 4, scatter split entries into child `SegEntry` records.
+pub fn split_to_seg_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) -> Vec<SegEntry> {
     assert!(split_entries.last().is_some());
-    let mut cell_entries: Vec<CellEntry> = vec![CellEntry::default(); out_vec_size as usize];
+    let mut seg_entries: Vec<SegEntry> = vec![SegEntry::default(); out_vec_size as usize];
 
     for &cell in &[TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT] {
         let ci = cell as usize;
@@ -629,7 +629,7 @@ pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) 
                 let base = curr.offsets[ci] as usize;
                 let mut cursor = base;
                 if has_segment {
-                    cell_entries[cursor] = CellEntry {
+                    seg_entries[cursor] = SegEntry {
                         entry_type: ABSTRACT,
                         data: shortcut,
                         seg_idx: curr.seg_idx,
@@ -641,7 +641,7 @@ pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) 
                     cursor += 1;
                 }
                 if has_winding {
-                    cell_entries[cursor] = CellEntry {
+                    seg_entries[cursor] = SegEntry {
                         entry_type: WINDING_INCREMENT,
                         data: curr.split_data.winding[ci],
                         seg_idx: NONE_U32,
@@ -656,22 +656,22 @@ pub fn split_to_cell_entry(split_entries: &mut [SplitEntry], out_vec_size: u32) 
             start = end;
         }
     }
-    cell_entries
+    seg_entries
 }
 
 /// Execute Kernel 1 ~ 4 of 4.2 Parallel Subdivision on CPU.
-pub fn subdivide_cell_entry(
-    cell_entries: &mut [CellEntry],
+pub fn subdivide_seg_entry(
+    seg_entries: &mut [SegEntry],
     parent_bound: &Rect,
     parent_mid_point: &Point,
     abs_segments: &[AbstractLineSegment],
-) -> anyhow::Result<Vec<CellEntry>> {
+) -> anyhow::Result<Vec<SegEntry>> {
     let mut split_entries =
-        build_split_entries(parent_bound, parent_mid_point, cell_entries, abs_segments);
+        build_split_entries(parent_bound, parent_mid_point, seg_entries, abs_segments);
     consolidate_winding_inc(&mut split_entries);
     let out_vec_size = update_to_global_offset(&mut split_entries);
-    let next_cell_entries = split_to_cell_entry(&mut split_entries, out_vec_size);
-    Ok(next_cell_entries)
+    let next_seg_entries = split_to_seg_entry(&mut split_entries, out_vec_size);
+    Ok(next_seg_entries)
 }
 
 fn print_entries<T: Debug>(entries: &[T], mut cell_pos: impl FnMut(&T) -> u32) {
