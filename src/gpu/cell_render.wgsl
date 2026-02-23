@@ -1,40 +1,6 @@
-const ABSTRACT: u32 = 1u << 0u;
-const WINDING_INCREMENT: u32 = 1u << 3u;
+// Depends on: common.wgsl
+
 const EPS: f32 = 1e-6;
-
-struct CellMetadata {
-    bbox_ltrb: vec4<f32>,
-    mid: vec2<f32>,
-    entry_start: u32,
-    entry_count: u32,
-    abstract_count: u32,
-    _pad: array<u32, 3>,
-}
-
-struct SegEntry {
-    entry_type: u32,
-    data: i32,
-    seg_idx: u32,
-    path_idx: u32,
-    cell_pos: u32,
-    cell_id: u32,
-    _pad: vec2<u32>,
-}
-
-struct AbstractLineSegment {
-    seg_type: u32,
-    path_idx: u32,
-    _pad0: vec2<u32>,
-    bbox_ltrb: vec4<f32>,
-    direction: u32,
-    a: f32,
-    b: f32,
-    c: f32,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-}
 
 struct PathPaintGpu {
     rgba: vec4<f32>,

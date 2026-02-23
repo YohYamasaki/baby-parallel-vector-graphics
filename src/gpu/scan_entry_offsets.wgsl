@@ -1,9 +1,6 @@
-const WG_SIZE: u32 = 2u;
+// Depends on: common.wgsl
 
-fn linearize_workgroup_id(wid: vec3<u32>, num_wg: vec3<u32>) -> u32 {
-    // linear = x + y*X + z*(X*Y)
-    return wid.x + wid.y * num_wg.x + wid.z * (num_wg.x * num_wg.y);
-}
+const WG_SIZE: u32 = 2u;
 
 fn inclusive_scan_block(lid: u32) {
     var offset = 1u;
@@ -28,11 +25,6 @@ fn inclusive_scan_block(lid: u32) {
 
 @group(0) @binding(0) var<storage, read_write> offsets_level_1: array<u32>;
 @group(0) @binding(1) var<storage, read_write> offsets_level_2: array<u32>;
-struct ScanParams {
-    level_len: u32,
-    carry_len: u32,
-    _pad: vec2<u32>,
-}
 @group(0) @binding(2) var<storage, read_write> scan_params: array<ScanParams>;
 
 var<workgroup> block_offsets: array<u32, WG_SIZE>;

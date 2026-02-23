@@ -1,24 +1,6 @@
+// Depends on: common.wgsl
+
 const WG_SIZE: u32 = 1u;
-
-struct CellMetadata {
-    bbox_ltrb: vec4<f32>,
-    mid: vec2<f32>,
-    entry_start: u32,
-    entry_count: u32,
-    abstract_count: u32,
-    _pad: array<u32, 3>,
-}
-
-struct SplitResultInfo {
-    seg_entries_length: u32,
-    min_seg: u32,
-    _pad: vec2<u32>,
-}
-
-fn linearize_workgroup_id(wid: vec3<u32>, num_wg: vec3<u32>) -> u32 {
-    // linear = x + y*X + z*(X*Y)
-    return wid.x + wid.y * num_wg.x + wid.z * (num_wg.x * num_wg.y);
-}
 
 fn get_child_bounds(parent_bbox: vec4<f32>, mid_x: f32, mid_y: f32) -> array<vec4<f32>, 4> {
     let p_left = parent_bbox[0];

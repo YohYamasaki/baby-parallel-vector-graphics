@@ -1,33 +1,6 @@
+// Depends on: common.wgsl
+
 const WG_SIZE: u32 = 1u;
-
-const ABSTRACT: u32 = 1u;
-
-struct CellMetadata {
-    bbox_ltrb: vec4<f32>,
-    mid: vec2<f32>,
-    entry_start: u32,
-    entry_count: u32,
-    abstract_count: u32,
-    _pad: array<u32, 3>,
-}
-
-struct SegEntry {
-    entry_type: u32,
-    data: i32,
-    seg_idx: u32,
-    path_idx: u32,
-    cell_pos: u32,
-    cell_id: u32,
-    _pad: array<u32, 2>
-}
-
-struct SplitResultInfo {
-    seg_entries_length: u32,
-}
-
-fn linearize_workgroup_id(wid: vec3<u32>, num_wg: vec3<u32>) -> u32 {
-    return wid.x + wid.y * num_wg.x + wid.z * (num_wg.x * num_wg.y);
-}
 
 @group(0) @binding(0) var<storage, read> seg_entries: array<SegEntry>;
 @group(0) @binding(1) var<storage, read_write> cell_metadata: array<CellMetadata>;

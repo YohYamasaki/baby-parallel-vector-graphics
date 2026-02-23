@@ -7,10 +7,10 @@ use bytemuck::{bytes_of, AnyBitPattern, Pod, Zeroable};
 use std::sync::mpsc::channel;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::wgt::BufferDescriptor;
+use crate::gpu::shader_loader::{load_with_common, load_with_split_helpers};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutEntry, BindingType, Buffer,
-    BufferBindingType, BufferUsages, ComputePipelineDescriptor, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages,
+    BufferBindingType, BufferUsages, ComputePipelineDescriptor, ShaderStages,
 };
 
 const WG_SIZE: u32 = 2;
@@ -345,30 +345,24 @@ struct Pipelines {
 
 impl Pipelines {
     fn new(device: &wgpu::Device) -> Self {
-        let quadcell_split_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("quadcell split shader"),
-            source: ShaderSource::Wgsl(include_str!("quadcell_split.wgsl").into()),
-        });
-        let split_seg_entry_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("split shader"),
-            source: ShaderSource::Wgsl(include_str!("build_split_entries.wgsl").into()),
-        });
-        let scan_winding_block_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("scan winding block shader"),
-            source: ShaderSource::Wgsl(include_str!("winding_block_sum.wgsl").into()),
-        });
-        let scan_entry_offsets_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("scan entry offsets shader"),
-            source: ShaderSource::Wgsl(include_str!("scan_entry_offsets.wgsl").into()),
-        });
-        let split_to_seg_entry_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("split to seg entry shader"),
-            source: ShaderSource::Wgsl(include_str!("split_to_seg_entry.wgsl").into()),
-        });
-        let update_metadata_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("update metadata shader"),
-            source: ShaderSource::Wgsl(include_str!("quadcell_update_metadata.wgsl").into()),
-        });
+        let quadcell_split_shader = load_with_common(
+            device, "quadcell split shader", include_str!("quadcell_split.wgsl"),
+        );
+        let split_seg_entry_shader = load_with_split_helpers(
+            device, "split shader", include_str!("build_split_entries.wgsl"),
+        );
+        let scan_winding_block_shader = load_with_common(
+            device, "scan winding block shader", include_str!("winding_block_sum.wgsl"),
+        );
+        let scan_entry_offsets_shader = load_with_common(
+            device, "scan entry offsets shader", include_str!("scan_entry_offsets.wgsl"),
+        );
+        let split_to_seg_entry_shader = load_with_split_helpers(
+            device, "split to seg entry shader", include_str!("split_to_seg_entry.wgsl"),
+        );
+        let update_metadata_shader = load_with_common(
+            device, "update metadata shader", include_str!("quadcell_update_metadata.wgsl"),
+        );
 
         let quadcell_split = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("quadcell split pipeline"),

@@ -6,13 +6,14 @@ use anyhow::Context;
 use bytemuck::{bytes_of, Pod, Zeroable};
 use std::sync::mpsc::channel;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
+use crate::gpu::shader_loader::load_with_common;
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, BindingResource, Buffer, BufferDescriptor, BufferUsages,
     CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor,
     Device, DeviceDescriptor, Extent3d, Features, MapMode, PipelineCompilationOptions, PollType,
-    PowerPreference, Queue, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, Surface,
-    SurfaceConfiguration, SurfaceError, SurfaceTexture, Texture, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+    PowerPreference, Queue, RequestAdapterOptions, Surface, SurfaceConfiguration, SurfaceError,
+    SurfaceTexture, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    TextureView, TextureViewDescriptor,
 };
 
 const RENDER_WG_SIZE_X: u32 = 8;
@@ -124,10 +125,9 @@ impl ComputeRenderer {
         };
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("cell render compute shader"),
-            source: ShaderSource::Wgsl(include_str!("cell_render.wgsl").into()),
-        });
+        let shader = load_with_common(
+            &device, "cell render compute shader", include_str!("cell_render.wgsl"),
+        );
 
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("cell render pipeline"),
